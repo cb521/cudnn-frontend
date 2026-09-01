@@ -268,6 +268,7 @@ def hstu_varlen_fwd_100(
 
     head_dim = q.shape[2]
     head_dim_v = v.shape[2]
+    batch_size = cu_seqlens_q.shape[0] - 1
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
@@ -282,8 +283,10 @@ def hstu_varlen_fwd_100(
     use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
+    # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
+    # launch; larger batches have enough query-head CTAs and favor one CTA.
     use_2cta_instrs = (
-        not is_q_len_one
+        (not is_q_len_one or batch_size < 256)
         and torch.cuda.get_device_capability(q.device) == (10, 7)
         and head_dim == 128
         and is_causal
