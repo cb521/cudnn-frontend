@@ -66,6 +66,7 @@ class HSTUAttentionForwardSm100:
         use_tma_O: bool = True,
         use_causal_mask_r2p: bool = True,
         use_2cta_instrs: bool = False,
+        is_q_len_one: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -76,6 +77,7 @@ class HSTUAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
+        self.is_q_len_one = is_q_len_one
         self.use_2cta_instrs = (
             use_2cta_instrs
             and head_dim == 128
@@ -92,8 +94,10 @@ class HSTUAttentionForwardSm100:
             and kBlockN == 128
         )
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
-        # Use one Q stage for 2-CTA MMA and when D >= 256.
-        self.q_stage = 1 if self.use_2cta_instrs or self.head_dim_padded >= 256 else 2
+        # A qlen=1 tile has no second Q block to overlap. Keeping one Q stage
+        # avoids issuing a fully masked QK/PV tile and cuts its Q/O storage in
+        # half. D256 and 2-CTA MMA have the same one-stage requirement.
+        self.q_stage = 1 if self.is_q_len_one or self.use_2cta_instrs or self.head_dim_padded >= 256 else 2
         self.s_stage = 2  # score stage for intra-warp overlap
         assert self.q_stage in [1, 2]
         assert self.s_stage in [2]

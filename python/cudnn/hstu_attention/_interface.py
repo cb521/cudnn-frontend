@@ -189,7 +189,8 @@ def hstu_varlen_fwd_100(
     assert head_dim == head_dim_v, "head_dim and head_dim_v must be equal"
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
-    kBlockM = 128
+    is_q_len_one = max_seqlen_q == 1
+    kBlockM = 64 if is_q_len_one else 128
     kBlockN = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
@@ -200,7 +201,8 @@ def hstu_varlen_fwd_100(
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
     use_2cta_instrs = (
-        torch.cuda.get_device_capability(q.device) == (10, 7)
+        not is_q_len_one
+        and torch.cuda.get_device_capability(q.device) == (10, 7)
         and head_dim == 128
         and is_causal
         and not is_local
@@ -249,7 +251,7 @@ def hstu_varlen_fwd_100(
     block_sparse_tensors = None
     if use_auto_block_metadata:
         q2k_block_size = (
-            kBlockM if head_dim == 256 else 2 * kBlockM,
+            kBlockM if head_dim == 256 or is_q_len_one else 2 * kBlockM,
             kBlockN,
         )
         with torch.cuda.nvtx.range("hstu_q2k_block_sparse_builder"):
@@ -304,6 +306,7 @@ def hstu_varlen_fwd_100(
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
             use_clc_descriptor=use_clc_descriptor,
+            is_q_len_one=is_q_len_one,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
