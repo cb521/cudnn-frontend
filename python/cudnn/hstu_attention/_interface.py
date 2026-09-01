@@ -408,7 +408,7 @@ def hstu_varlen_bwd_100(
     assert do.shape == q.shape, "do and q must have the same shape"
 
     is_q_len_one_d128 = max_seqlen_q == 1 and head_dim == 128
-    m_block_size = 64 if is_q_len_one_d128 else 128
+    m_block_size = 128
     n_block_size = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
