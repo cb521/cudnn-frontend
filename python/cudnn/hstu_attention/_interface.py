@@ -13,6 +13,7 @@ from cutlass.cute.typing import Int32, Float16, BFloat16
 
 from ._kernels.hstu_fwd import HSTUAttentionForwardSm100
 from ._kernels.hstu_bwd import HSTUAttentionBackwardSm100
+from ._kernels.hstu_bwd_q1 import HSTUAttentionBackwardQlen1Sm100
 from ._kernels.block_sparse_builder import (
     build_hstu_k2q_block_sparse,
     build_hstu_q2k_block_sparse,
@@ -156,6 +157,87 @@ def _supports_bwd_direct_grad_layout(t: torch.Tensor) -> bool:
     # represents broadcast strides as static zero, so mixing them with a
     # previously compiled nonzero-stride descriptor would not be type-safe.
     return _supports_bwd_original_qkv_layout(t) and t.stride(0) != 0 and t.stride(1) != 0
+
+
+def _hstu_varlen_bwd_q1_direct(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    alpha: float,
+    scaling_seqlen: float,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    *,
+    _compile_only: bool,
+):
+    no_preallocated_grads = dq is None and dk is None and dv is None
+    if not no_preallocated_grads and (dq is None or dk is None or dv is None):
+        raise ValueError("dq, dk, and dv must either all be supplied or all be omitted")
+    if no_preallocated_grads:
+        dq, dk, dv = [torch.empty_like(tensor, memory_format=torch.preserve_format) for tensor in (q, k, v)]
+    assert dq is not None and dk is not None and dv is not None
+    if dq.shape != q.shape or dk.shape != k.shape or dv.shape != v.shape:
+        raise ValueError("HSTU gradient outputs must match their corresponding inputs")
+
+    compile_key = (q.device, q.dtype)
+    if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
+        q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
+            _mark_dynamic_tensor(tensor, 1)
+            for tensor in (q, k, v, do, dq, dk, dv)
+        ]
+        cu_q_tensor, cu_k_tensor = [
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
+            for tensor in (cu_seqlens_q, cu_seqlens_k)
+        ]
+        kernel = HSTUAttentionBackwardQlen1Sm100(
+            element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
+        )
+        compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+            _hstu_varlen_bwd_q1_direct.compile_cache[compile_key] = cute.compile(
+                kernel,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                do_tensor,
+                dq_tensor,
+                dk_tensor,
+                dv_tensor,
+                cu_q_tensor,
+                cu_k_tensor,
+                Int32(cu_seqlens_q.shape[0] - 1),
+                Int32(q.shape[1]),
+                alpha,
+                scaling_seqlen,
+                compile_stream,
+                options="--enable-tvm-ffi",
+            )
+
+    if not _compile_only:
+        with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+            _hstu_varlen_bwd_q1_direct.compile_cache[compile_key](
+                q,
+                k,
+                v,
+                do,
+                dq,
+                dk,
+                dv,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                Int32(cu_seqlens_q.shape[0] - 1),
+                Int32(q.shape[1]),
+                alpha,
+                scaling_seqlen,
+            )
+    return dq, dk, dv
+
+
+_hstu_varlen_bwd_q1_direct.compile_cache = {}
 
 
 def hstu_varlen_fwd_100(
@@ -417,7 +499,31 @@ def hstu_varlen_bwd_100(
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_d128
-    use_q_major_scheduler = is_q_len_one_d128 and not is_arbitrary
+    q1_inputs_direct = all(
+        _supports_bwd_original_qkv_layout(tensor)
+        for tensor in (q, k, v, do)
+    )
+    q1_outputs_direct = (dq is None and dk is None and dv is None) or (
+        dq is not None
+        and dk is not None
+        and dv is not None
+        and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
+    )
+    if is_q_len_one_d128 and is_causal and not is_arbitrary and q1_inputs_direct and q1_outputs_direct:
+        return _hstu_varlen_bwd_q1_direct(
+            do,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            alpha,
+            scaling_seqlen,
+            dq,
+            dk,
+            dv,
+            _compile_only=_compile_only,
+        )
     if head_dim == 256:
         # The fused one-CTA kernel's live TMEM ranges exceed the SM100
         # 512-column capacity at D=256. Use the dedicated two-kernel path:
@@ -492,7 +598,6 @@ def hstu_varlen_bwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
-        use_q_major_scheduler,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -600,7 +705,6 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
-            use_q_major_scheduler=use_q_major_scheduler,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(
