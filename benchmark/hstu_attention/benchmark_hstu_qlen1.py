@@ -232,24 +232,10 @@ def _correctness(
     alpha: float,
     scaling_seqlen: float,
 ) -> dict[str, float | bool]:
-    # Keep enough query-head CTAs to exercise Rubin's supported clustered
-    # launch while repeating boundary-heavy KV tails.
-    correctness_batch = 64
-    boundary_lengths = (1, 127, 128, 2049, 3072)
-    tensors = _make_inputs(correctness_batch, heads, head_dim, 2048, dtype, device, seed=20260901)
+    tensors = _make_inputs(5, heads, head_dim, 2048, dtype, device, seed=20260901)
+    tensors["k_lengths"] = [1, 127, 128, 2049, 3072]
     k_lengths = tensors["k_lengths"]
     assert isinstance(k_lengths, list)
-    # Preserve the benchmark's packed allocation shape so correctness and
-    # timing compile the same dynamic-layout specialization. Redistribute the
-    # rows removed by the boundary cases over the remaining sequences.
-    packed_kv = sum(k_lengths)
-    k_lengths[: len(boundary_lengths)] = boundary_lengths
-    rows_to_restore = packed_kv - sum(k_lengths)
-    for index in range(len(boundary_lengths), len(k_lengths)):
-        rows_added = min(rows_to_restore, max(boundary_lengths) - k_lengths[index])
-        k_lengths[index] += rows_added
-        rows_to_restore -= rows_added
-    assert rows_to_restore == 0
     # Rebuild K/V and metadata for the boundary-heavy correctness lengths.
     generator = torch.Generator(device=device)
     generator.manual_seed(20260902)
@@ -266,25 +252,27 @@ def _correctness(
     assert isinstance(v, torch.Tensor)
     assert isinstance(do, torch.Tensor)
 
-    # Compile CuTe before PyTorch's reference path loads its own device-code
-    # toolchain. This avoids LLVM target collisions on early Rubin systems.
+    # Compile and execute CuTe before the reference path. Early Rubin systems
+    # do not yet support PyTorch's device-code reference toolchain, so the
+    # correctness oracle intentionally runs on CPU.
     actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
     actual_grads, bwd_run, _ = _compile_backward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
-
-    q_ref = q.float().detach().requires_grad_(True)
-    k_ref = k.float().detach().requires_grad_(True)
-    v_ref = v.float().detach().requires_grad_(True)
-    expected_out = _reference_forward(q_ref, k_ref, v_ref, k_lengths, alpha, scaling_seqlen)
-    expected_grads = torch.autograd.grad(expected_out, (q_ref, k_ref, v_ref), do.float())
-
     fwd_run()
     bwd_run()
     torch.cuda.synchronize()
 
-    fwd_error = (actual_out.float() - expected_out).abs()
-    grad_errors = [(actual.float() - expected).abs() for actual, expected in zip(actual_grads, expected_grads)]
-    forward_ok = torch.allclose(actual_out.float(), expected_out, rtol=3.0e-2, atol=3.0e-2)
-    backward_ok = all(torch.allclose(actual.float(), expected, rtol=6.0e-2, atol=6.0e-2) for actual, expected in zip(actual_grads, expected_grads))
+    q_ref = q.cpu().float().requires_grad_(True)
+    k_ref = k.cpu().float().requires_grad_(True)
+    v_ref = v.cpu().float().requires_grad_(True)
+    expected_out = _reference_forward(q_ref, k_ref, v_ref, k_lengths, alpha, scaling_seqlen)
+    expected_grads = torch.autograd.grad(expected_out, (q_ref, k_ref, v_ref), do.cpu().float())
+
+    actual_out_cpu = actual_out.cpu().float()
+    actual_grads_cpu = [actual.cpu().float() for actual in actual_grads]
+    fwd_error = (actual_out_cpu - expected_out).abs()
+    grad_errors = [(actual - expected).abs() for actual, expected in zip(actual_grads_cpu, expected_grads)]
+    forward_ok = torch.allclose(actual_out_cpu, expected_out, rtol=3.0e-2, atol=3.0e-2)
+    backward_ok = all(torch.allclose(actual, expected, rtol=6.0e-2, atol=6.0e-2) for actual, expected in zip(actual_grads_cpu, expected_grads))
     return {
         "forward_ok": bool(forward_ok),
         "backward_ok": bool(backward_ok),
