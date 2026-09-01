@@ -509,7 +509,15 @@ def hstu_varlen_bwd_100(
         and dv is not None
         and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     )
-    if is_q_len_one_d128 and is_causal and not is_arbitrary and q1_inputs_direct and q1_outputs_direct:
+    use_q1_direct_kernel = (
+        is_q_len_one_d128
+        and batch_size >= 256
+        and is_causal
+        and not is_arbitrary
+        and q1_inputs_direct
+        and q1_outputs_direct
+    )
+    if use_q1_direct_kernel:
         return _hstu_varlen_bwd_q1_direct(
             do,
             q,
