@@ -417,6 +417,7 @@ def hstu_varlen_bwd_100(
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_d128
+    use_q_major_scheduler = is_q_len_one_d128 and not is_arbitrary
     if head_dim == 256:
         # The fused one-CTA kernel's live TMEM ranges exceed the SM100
         # 512-column capacity at D=256. Use the dedicated two-kernel path:
@@ -491,6 +492,7 @@ def hstu_varlen_bwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
+        use_q_major_scheduler,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -598,6 +600,7 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
+            use_q_major_scheduler=use_q_major_scheduler,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(

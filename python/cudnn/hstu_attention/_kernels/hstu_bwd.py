@@ -24,6 +24,7 @@ from .fast_math import FastSilU
 from .mask import AttentionMask
 from .seqlen_info import SeqlenInfo
 from .tile_scheduler import (
+    QMajorBwdScheduler,
     SingleTileBwdScheduler,
     TileSchedulerArguments,
 )
@@ -57,6 +58,7 @@ class HSTUAttentionBackwardSm100:
         func_num: int = 0,
         use_auto_block_metadata: bool = False,
         use_2cta_instrs: bool = False,
+        use_q_major_scheduler: bool = False,
     ):
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
@@ -64,6 +66,8 @@ class HSTUAttentionBackwardSm100:
         self.tile_n = tile_n
         self.tile_hdim = head_dim
         self.use_2cta_instrs = use_2cta_instrs
+        self.use_q_major_scheduler = use_q_major_scheduler
+        assert not self.use_q_major_scheduler or not self.use_2cta_instrs
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         self.cta_tiler = (
             tile_n,
@@ -726,7 +730,7 @@ class HSTUAttentionBackwardSm100:
             (self.tile_m, 32),
         )
 
-        TileScheduler = SingleTileBwdScheduler
+        TileScheduler = QMajorBwdScheduler if self.use_q_major_scheduler else SingleTileBwdScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(problem_shape[1], self.cta_tiler[0]),
             cute.size(h_k),
