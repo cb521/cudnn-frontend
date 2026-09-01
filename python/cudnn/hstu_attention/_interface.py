@@ -190,7 +190,7 @@ def hstu_varlen_fwd_100(
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
     is_q_len_one = max_seqlen_q == 1
-    kBlockM = 64 if is_q_len_one else 128
+    kBlockM = 128
     kBlockN = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right

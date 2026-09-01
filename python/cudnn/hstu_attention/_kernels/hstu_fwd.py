@@ -2669,14 +2669,14 @@ class HSTUAttentionForwardSm100:
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.kBlockM // 4)),
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
             Float32,
         )
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tStSi)
 
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(self.kBlockM // 8)),
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
             Float32,
         )
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
