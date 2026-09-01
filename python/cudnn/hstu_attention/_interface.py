@@ -391,7 +391,7 @@ def hstu_varlen_fwd_100(
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
             use_clc_descriptor=use_clc_descriptor,
-            is_q_len_one=is_q_len_one,
+            is_q_len_one=is_q_len_one and not use_2cta_instrs,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
