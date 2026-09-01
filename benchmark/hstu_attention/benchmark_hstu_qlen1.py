@@ -266,14 +266,17 @@ def _correctness(
     assert isinstance(v, torch.Tensor)
     assert isinstance(do, torch.Tensor)
 
+    # Compile CuTe before PyTorch's reference path loads its own device-code
+    # toolchain. This avoids LLVM target collisions on early Rubin systems.
+    actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+    actual_grads, bwd_run, _ = _compile_backward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+
     q_ref = q.float().detach().requires_grad_(True)
     k_ref = k.float().detach().requires_grad_(True)
     v_ref = v.float().detach().requires_grad_(True)
     expected_out = _reference_forward(q_ref, k_ref, v_ref, k_lengths, alpha, scaling_seqlen)
     expected_grads = torch.autograd.grad(expected_out, (q_ref, k_ref, v_ref), do.float())
 
-    actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
-    actual_grads, bwd_run, _ = _compile_backward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
     fwd_run()
     bwd_run()
     torch.cuda.synchronize()
