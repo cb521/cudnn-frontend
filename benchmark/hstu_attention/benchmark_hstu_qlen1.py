@@ -237,12 +237,19 @@ def _correctness(
     correctness_batch = 64
     boundary_lengths = (1, 127, 128, 2049, 3072)
     tensors = _make_inputs(correctness_batch, heads, head_dim, 2048, dtype, device, seed=20260901)
-    tensors["k_lengths"] = [boundary_lengths[index % len(boundary_lengths)] for index in range(correctness_batch)]
     k_lengths = tensors["k_lengths"]
     assert isinstance(k_lengths, list)
-    # Keep the packed allocation tile-aligned. The individual sequences still
-    # exercise both sides of 128 and long residual tails.
-    k_lengths[-1] += (-sum(k_lengths)) % 128
+    # Preserve the benchmark's packed allocation shape so correctness and
+    # timing compile the same dynamic-layout specialization. Redistribute the
+    # rows removed by the boundary cases over the remaining sequences.
+    packed_kv = sum(k_lengths)
+    k_lengths[: len(boundary_lengths)] = boundary_lengths
+    rows_to_restore = packed_kv - sum(k_lengths)
+    for index in range(len(boundary_lengths), len(k_lengths)):
+        rows_added = min(rows_to_restore, max(boundary_lengths) - k_lengths[index])
+        k_lengths[index] += rows_added
+        rows_to_restore -= rows_added
+    assert rows_to_restore == 0
     # Rebuild K/V and metadata for the boundary-heavy correctness lengths.
     generator = torch.Generator(device=device)
     generator.manual_seed(20260902)
