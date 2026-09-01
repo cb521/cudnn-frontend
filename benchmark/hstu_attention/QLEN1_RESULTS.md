@@ -128,6 +128,6 @@ PyTorch oracle. The oracle runs on CPU so it also works on early Rubin systems
 whose PyTorch device-code toolchain does not yet recognize SM10.7. A separate
 forced-path test checks `tc-small` against `tc` at KV lengths
 `1, 127, 128, 129, 2049`; dQ, dK, and dV are bitwise identical on both B300
-and Rubin, including 12 repeated launches used to check for races. The final
-automatic dispatch passes the forward and all three gradient checks on both
-architectures, with maximum absolute gradient error around `1e-5`.
+and Rubin. The final automatic dispatch passes the forward and all three
+gradient checks on both architectures, with maximum absolute gradient error
+around `1e-5`.
