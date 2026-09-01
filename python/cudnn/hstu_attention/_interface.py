@@ -186,7 +186,7 @@ def _hstu_varlen_bwd_q1_direct(
     compile_key = (q.device, q.dtype)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-            _mark_dynamic_tensor(tensor, 1)
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
             for tensor in (q, k, v, do, dq, dk, dv)
         ]
         cu_q_tensor, cu_k_tensor = [
