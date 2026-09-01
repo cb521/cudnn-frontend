@@ -13,7 +13,10 @@ seven groups of 30 executions. The baseline is commit `8baf903`, which adds
 only the benchmark on top of the original HSTU kernel. Baseline and candidate
 were run sequentially in the same allocation.
 
-## Results
+## Initial forward and direct-path results
+
+These controlled baseline/candidate measurements predate the small-MMA
+backward path. The final backward dispatch is reported below.
 
 ### B300 (SM10.3)
 
@@ -31,55 +34,65 @@ were run sequentially in the same allocation.
 | 512 | 0.2285 | 0.2249 | 1.02x | 1.0261 | 0.8069 | 1.27x |
 | 1024 | 0.4557 | 0.4322 | 1.05x | 2.0375 | 1.4264 | 1.43x |
 
-## Tensor-core Q-major backward experiment
+## Small-MMA Q-major backward
 
-The benchmark can force three backward implementations with
-`--backward-impl legacy|tc|direct`. `legacy` is the original tensor-core
-schedule, `tc` is the Q-major tensor-core experiment, and `direct` is the
-specialized CUDA-core path used by the production dispatch at batch sizes of
-at least 256. `auto` retains that production dispatch.
-
-The following measurements use the same workload and allocations as above,
-with 10 warmups and the median of five groups of 30 executions.
+The benchmark can force four backward implementations with
+`--backward-impl legacy|tc|tc-small|direct`. `legacy` is the original
+tensor-core schedule, `tc` is the first Q-major experiment, `tc-small` is the
+new small-MMA path, and `direct` is the specialized CUDA-core path. The tables
+below use 10 warmups and the median of five groups of 30 executions.
 
 ### B300 (SM10.3)
 
-| Batch | Legacy TC (ms) | Q-major TC (ms) | Q-major vs legacy | Scalar direct (ms) | Direct vs Q-major TC |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 0.2083 | 0.2548 | 0.82x | 0.3866 | 0.66x |
-| 512 | 1.7138 | 1.4321 | 1.20x | 1.0298 | 1.39x |
-| 1024 | 3.4460 | 2.8148 | 1.22x | 1.8693 | 1.51x |
+| Batch | Q-major TC (ms) | Small-MMA TC (ms) | Speedup |
+| ---: | ---: | ---: | ---: |
+| 64 | 0.2575 | 0.1846 | 1.39x |
+| 512 | 1.4395 | 1.0736 | 1.34x |
+| 1024 | 2.8185 | 2.1168 | 1.33x |
 
 ### Rubin (SM10.7)
 
-| Batch | Legacy TC (ms) | Q-major TC (ms) | Q-major vs legacy | Scalar direct (ms) | Direct vs Q-major TC |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 0.1301 | 0.1763 | 0.74x | 0.3288 | 0.54x |
-| 512 | 0.9992 | 0.8766 | 1.14x | 0.7644 | 1.15x |
-| 1024 | 2.0010 | 1.7084 | 1.17x | 1.3456 | 1.27x |
+| Batch | Q-major TC (ms) | Small-MMA TC (ms) | Speedup |
+| ---: | ---: | ---: | ---: |
+| 64 | 0.1835 | 0.1352 | 1.36x |
+| 512 | 0.9274 | 0.7761 | 1.19x |
+| 1024 | 1.7963 | 1.5186 | 1.18x |
 
-The Q-major tensor-core path follows the FA2 `bwd_loop_opt` loop-order idea:
-one CTA owns a batch/head pair, keeps its one Q row fixed, and walks the KV
-tiles. Each KV tile is still evaluated by UMMA. The one valid dQ row is copied
-from TMEM and accumulated in registers across KV tiles, then written once;
-dK and dV are written directly by their owning CTA. This removes the global
-dQ accumulation workspace, workspace zeroing, conversion launch, and global
-dQ reductions from this path.
+The new path keeps the FA2 `bwd_loop_opt` loop order: one CTA owns one
+batch/head pair, keeps its single Q fixed, and walks the KV tiles. The one
+valid dQ row remains local across all KV tiles and is written once, while the
+CTA writes its disjoint dK/dV rows directly. There are no dQ atomics, global
+FP32 dQ workspace, workspace-zeroing launch, or conversion launch.
 
-The experiment improves the old tensor-core path once the batch supplies
-enough batch/head CTAs, but it does not beat the scalar direct kernel. With
-`seqlen_q=1`, an UMMA tile still reserves and evaluates a 128-row Q tile while
-only one row is useful. The direct kernel instead assigns warps to disjoint KV
-rows and computes only the required row. Reducing the tensor-core Q tile to 64
-is not a standalone tuning change: the current dQ MMA/TMEM load mapping assumes
-the 128-row layout and needs a different transposed dQ MMA design. Therefore
-the Q-major tensor-core implementation remains an explicit comparison option,
-and the `auto` policy remains unchanged: legacy at batch 64 and scalar direct
-at batch 512/1024 for the target cases.
+The computation is still tensor-core based. S, dP, dK, and dV use an
+M128N16K128 tile instead of reserving 128 Q rows. dQ uses the transposed
+`K^T @ dS^T` form with M128N8K128, which is the smallest useful N shape for
+this SM100-family UMMA path. K is loaded once and reinterpreted as the
+transposed dQ operand in shared memory. Four compute warps replace eight for
+the reduced Q tile.
 
-The forced `tc` path passes the variable-length oracle on both architectures.
-Maximum absolute `(dQ, dK, dV)` errors are `(9.13e-6, 1.83e-6, 1.45e-6)` on
-B300 and `(6.65e-6, 1.22e-6, 1.04e-6)` on Rubin.
+## Automatic dispatch
+
+The crossover was measured at extra batch sizes rather than inferred from the
+three target points:
+
+- B300: `tc-small` through BS=384; `direct` from the measured BS=448 point.
+- Rubin: `legacy` below BS=128, `tc-small` through BS=832, and `direct` from
+  the measured BS=896 point.
+- Other SM100-family devices retain the previous policy.
+
+For the requested batches, the resulting automatic choices and final timings
+are:
+
+| GPU | BS=64 | BS=512 | BS=1024 |
+| --- | ---: | ---: | ---: |
+| B300 | 0.1860 ms (`tc-small`) | 1.0320 ms (`direct`) | 1.8724 ms (`direct`) |
+| Rubin | 0.1313 ms (`legacy`) | 0.7768 ms (`tc-small`) | 1.4907 ms (`direct`) |
+
+Against the implementation selected by the previous policy, the meaningful
+target-case changes are 12.5% lower latency at B300 BS=64 and 8.7% lower
+latency at Rubin BS=512. The other requested points keep their previous
+implementation.
 
 ## Design
 
@@ -88,17 +101,10 @@ second fully masked 128-row Q tile. Small Rubin launches retain the existing
 two-CTA path because its extra occupancy is faster at batch size 64; larger
 launches and B300 use the one-CTA specialization.
 
-Backward uses a workload dispatch:
-
-- Batches below 256 retain the tensor-core kernel, but use one CTA instead of
-  a two-CTA cluster for D128 single-query work.
-- Batches of at least 256 use `hstu_bwd_q1.py`. One CTA owns one batch/head
-  pair, eight warps traverse disjoint KV rows, dK/dV are written directly,
-  and dQ stays in registers until one shared-memory CTA reduction. This
-  Q-major path has no dQ atomics, FP32 accumulation workspace, workspace
-  zeroing, or gradient conversion kernel.
-- Unsupported layouts and non-causal or arbitrary masks keep the existing
-  implementation.
+Backward chooses among the original tensor-core kernel, the new small-MMA
+Q-major kernel, and `hstu_bwd_q1.py` using the measured architecture-specific
+crossovers above. Unsupported layouts and non-causal or arbitrary masks keep
+the existing implementation.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.
@@ -120,5 +126,8 @@ to the main path.
 The benchmark checks KV lengths `1, 127, 128, 2049, 3072` against a float32
 PyTorch oracle. The oracle runs on CPU so it also works on early Rubin systems
 whose PyTorch device-code toolchain does not yet recognize SM10.7. A separate
-batch-256 test exercises the direct Q-major backward dispatch. B300 and Rubin
-both pass the forward and all three gradient checks.
+forced-path test checks `tc-small` against `tc` at KV lengths
+`1, 127, 128, 129, 2049`; dQ, dK, and dV are bitwise identical on both B300
+and Rubin, including 12 repeated launches used to check for races. The final
+automatic dispatch passes the forward and all three gradient checks on both
+architectures, with maximum absolute gradient error around `1e-5`.

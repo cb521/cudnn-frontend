@@ -236,6 +236,39 @@ def _hstu_varlen_bwd_q1_direct(
 _hstu_varlen_bwd_q1_direct.compile_cache = {}
 
 
+_q1_device_capability_cache: dict[torch.device, tuple[int, int]] = {}
+
+
+def _select_q1_bwd_algorithm(
+    requested: str,
+    batch_size: int,
+    device: torch.device,
+) -> str:
+    """Resolve the qlen=1 implementation from measured SM10x crossovers."""
+    if requested != "auto":
+        return requested
+
+    capability = _q1_device_capability_cache.get(device)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        _q1_device_capability_cache[device] = capability
+
+    # B300 (SM103): the small MMA path wins through BS=384 and the direct
+    # path wins from the measured BS=448 point onward.
+    if capability == (10, 3):
+        return "tc-small" if batch_size < 448 else "direct"
+
+    # Rubin (SM107): legacy wins at BS<=64, the small MMA path wins from
+    # BS=128 through BS=832, and direct wins from BS=896 onward.
+    if capability == (10, 7):
+        if batch_size < 128:
+            return "legacy"
+        return "tc-small" if batch_size < 896 else "direct"
+
+    # Preserve the existing policy on other SM100-family devices.
+    return "direct" if batch_size >= 256 else "legacy"
+
+
 def hstu_varlen_fwd_100(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -503,13 +536,15 @@ def hstu_varlen_bwd_100(
     q1_outputs_direct = (dq is None and dk is None and dv is None) or (
         dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     )
-    if _q1_bwd_algorithm not in ("auto", "direct", "tc", "legacy"):
+    if _q1_bwd_algorithm not in ("auto", "direct", "tc", "tc-small", "legacy"):
         raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
     q1_direct_supported = is_q_len_one_d128 and is_causal and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
-    if _q1_bwd_algorithm in ("direct", "tc") and not q1_direct_supported:
+    if _q1_bwd_algorithm in ("direct", "tc", "tc-small") and not q1_direct_supported:
         raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal D=128 qlen=1 with direct layouts")
-    use_q1_direct_kernel = q1_direct_supported and (_q1_bwd_algorithm == "direct" or (_q1_bwd_algorithm == "auto" and batch_size >= 256))
-    use_q_major_scheduler = _q1_bwd_algorithm == "tc"
+    selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device) if q1_direct_supported else _q1_bwd_algorithm
+    use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm == "direct"
+    use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
+    use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"
     if use_q1_direct_kernel:
         return _hstu_varlen_bwd_q1_direct(
             do,
@@ -600,6 +635,7 @@ def hstu_varlen_bwd_100(
         use_auto_block_metadata,
         use_2cta_instrs,
         use_q_major_scheduler,
+        use_q1_small_mma,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -708,6 +744,7 @@ def hstu_varlen_bwd_100(
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
             use_q_major_scheduler=use_q_major_scheduler,
+            use_q1_small_mma=use_q1_small_mma,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(

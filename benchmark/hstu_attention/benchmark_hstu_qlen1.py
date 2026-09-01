@@ -348,7 +348,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
-    parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "legacy"), default="auto")
+    parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "tc-small", "legacy"), default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--groups", type=int, default=7)
@@ -415,6 +415,8 @@ def main() -> None:
                 **_measure_ms(run, args.warmup, args.iterations, args.groups),
             }
         if args.direction in ("backward", "both"):
+            if args.backward_impl == "auto":
+                case["selected_backward_impl"] = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
             _, run, compile_seconds = _compile_backward(
                 tensors,
                 max(k_lengths),

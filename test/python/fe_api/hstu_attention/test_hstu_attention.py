@@ -1503,8 +1503,9 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
-def test_d128_single_query_direct_backward_matches_pytorch():
+def test_d128_single_query_auto_backward_matches_pytorch():
     _interface._hstu_varlen_bwd_q1_direct.compile_cache.clear()
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
     torch.manual_seed(2026)
     batch, heads, head_dim = 256, 1, 128
     k_lengths = (1, 127, 128, 257) * (batch // 4)
@@ -1548,7 +1549,9 @@ def test_d128_single_query_direct_backward_matches_pytorch():
     )
     expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
 
-    assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
+    selected = _interface._select_q1_bwd_algorithm("auto", batch, q.device)
+    selected_cache = _interface._hstu_varlen_bwd_q1_direct.compile_cache if selected == "direct" else _interface.hstu_varlen_bwd_100.compile_cache
+    assert len(selected_cache) == 1
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
 

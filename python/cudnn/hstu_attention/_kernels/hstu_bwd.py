@@ -59,6 +59,7 @@ class HSTUAttentionBackwardSm100:
         use_auto_block_metadata: bool = False,
         use_2cta_instrs: bool = False,
         use_q_major_scheduler: bool = False,
+        use_q1_small_mma: bool = False,
     ):
         self.element_dtype = element_dtype
         self.acc_dtype = Float32
@@ -67,7 +68,13 @@ class HSTUAttentionBackwardSm100:
         self.tile_hdim = head_dim
         self.use_2cta_instrs = use_2cta_instrs
         self.use_q_major_scheduler = use_q_major_scheduler
+        self.use_q1_small_mma = use_q1_small_mma
         assert not self.use_q_major_scheduler or not self.use_2cta_instrs
+        assert not self.use_q1_small_mma or self.use_q_major_scheduler
+        # Only the first Q row is valid. Keep the main K @ Q^T family on the
+        # M128N16 UMMA shape and use transposed M128N8 for K^T @ dS^T -> dQ^T.
+        mma_tile_m = 16 if self.use_q1_small_mma else tile_m
+        dq_mma_tile_n = 8 if self.use_q1_small_mma else head_dim
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         self.cta_tiler = (
             tile_n,
@@ -77,33 +84,34 @@ class HSTUAttentionBackwardSm100:
         # For S
         self.mma_tiler_kq = (
             self.cta_group_size * tile_n,
-            tile_m,
+            mma_tile_m,
             head_dim,
         )
         # For dP
         self.mma_tiler_vdo = (
             self.cta_group_size * tile_n,
-            tile_m,
+            mma_tile_m,
             head_dim,
         )
         # For dV
         self.mma_tiler_pdo = (
             self.cta_group_size * tile_n,
             head_dim,
-            tile_m,
+            mma_tile_m,
         )
         # For dK
         self.mma_tiler_dsq = (
             self.cta_group_size * tile_n,
             head_dim,
-            tile_m,
+            mma_tile_m,
         )
         # For dQ
         self.mma_tiler_dsk = (
-            tile_m,
-            head_dim,
+            head_dim if self.use_q1_small_mma else (tile_n if self.use_q_major_scheduler else tile_m),
+            dq_mma_tile_n,
             self.cta_group_size * tile_n,
         )
+        self.dq_tile_m = self.mma_tiler_dsk[0]
         self.cluster_shape_mn = (self.cta_group_size, 1)
         self.is_causal = is_causal
         self.is_local = is_local
@@ -116,14 +124,14 @@ class HSTUAttentionBackwardSm100:
         assert self.use_auto_block_metadata == self.is_arbitrary, "Block metadata must be enabled exactly for arbitrary masking"
 
         self.reduce_warp_ids = (0, 1, 2, 3)
-        self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
-        self.mma_warp_id = 12
-        self.load_warp_id = 13
-        self.relay_warp_id = 14
-        self.empty_warp_id = 15
+        self.compute_warp_ids = (4, 5, 6, 7) if self.use_q1_small_mma else (4, 5, 6, 7, 8, 9, 10, 11)
+        self.mma_warp_id = 8 if self.use_q1_small_mma else 12
+        self.load_warp_id = 9 if self.use_q1_small_mma else 13
+        self.relay_warp_id = 10 if self.use_q1_small_mma else 14
+        self.empty_warp_id = 11 if self.use_q1_small_mma else 15
 
         self.num_reduce_warps = 4
-        self.num_compute_warps = 8
+        self.num_compute_warps = len(self.compute_warp_ids)
 
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
@@ -198,6 +206,8 @@ class HSTUAttentionBackwardSm100:
         self.sdQaccum_stage = 4 if self.use_2cta_instrs else 2
         assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.cta_group_size // self.dQ_reduce_ncol
+        self.qmajor_dq_ncol = self.tile_hdim if self.use_q1_small_mma else self.dQ_reduce_ncol_t2r
+        self.qmajor_dq_stages = 1 if self.use_q1_small_mma else self.tile_hdim // self.qmajor_dq_ncol
 
     @cute.jit
     def __call__(
@@ -386,17 +396,35 @@ class HSTUAttentionBackwardSm100:
             self.element_dtype,
             self.dO_stage,
         )
-        dS_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma_dQ,
-            self.mma_tiler_dsk,
-            self.element_dtype,
-            self.single_stage,
+        dS_smem_layout_staged = (
+            sm100_utils.make_smem_layout_b(
+                tiled_mma_dQ,
+                self.mma_tiler_dsk,
+                self.element_dtype,
+                self.single_stage,
+            )
+            if self.use_q1_small_mma
+            else sm100_utils.make_smem_layout_a(
+                tiled_mma_dQ,
+                self.mma_tiler_dsk,
+                self.element_dtype,
+                self.single_stage,
+            )
         )
-        KT_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma_dQ,
-            self.mma_tiler_dsk,
-            self.element_dtype,
-            self.K_stage,
+        KT_smem_layout_staged = (
+            sm100_utils.make_smem_layout_a(
+                tiled_mma_dQ,
+                self.mma_tiler_dsk,
+                self.element_dtype,
+                self.K_stage,
+            )
+            if self.use_q1_small_mma
+            else sm100_utils.make_smem_layout_b(
+                tiled_mma_dQ,
+                self.mma_tiler_dsk,
+                self.element_dtype,
+                self.K_stage,
+            )
         )
         dST_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma_dK,
@@ -433,13 +461,13 @@ class HSTUAttentionBackwardSm100:
             sm100_utils.get_smem_layout_atom_ab(
                 tcgen05.OperandMajorMode.K,
                 self.acc_dtype,
-                (self.tile_m, 32),
+                (self.dq_tile_m, 32),
             ),
             self.acc_dtype,
         )
         dQ_tma_smem_layout_staged = cute.tile_to_shape(
             dQ_smem_layout_atom,
-            (self.tile_m, 32, 2),
+            (self.dq_tile_m, 32, 2),
             order=(1, 0, 2),
         )
         dQ_smem_layout_staged = (
@@ -448,7 +476,7 @@ class HSTUAttentionBackwardSm100:
                 0,
                 cute.make_layout(
                     (
-                        self.tile_m * self.dQ_reduce_ncol,
+                        self.dq_tile_m * self.dQ_reduce_ncol,
                         self.sdQaccum_stage,
                     )
                 ),
@@ -649,6 +677,8 @@ class HSTUAttentionBackwardSm100:
             )
         )
         dS_xchg_size = self.tile_n * self.tile_m // 2 if self.use_2cta_instrs else 0
+        dST_smem_size = cute.cosize(dST_smem_layout_staged) if self.use_q1_small_mma else 0
+        dQ_smem_size = cute.cosize(dQ_smem_layout_staged)
 
         @cute.struct
         class SharedStorage:
@@ -706,12 +736,16 @@ class HSTUAttentionBackwardSm100:
                 cute.struct.MemRange[self.element_dtype, cute.cosize(dS_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            sdST: cute.struct.Align[
+                cute.struct.MemRange[self.element_dtype, dST_smem_size],
+                self.buffer_align_bytes,
+            ]
             sdS_xchg: cute.struct.Align[
                 cute.struct.MemRange[self.element_dtype, dS_xchg_size],
                 self.buffer_align_bytes,
             ]
             sdQ: cute.struct.Align[
-                cute.struct.MemRange[self.acc_dtype, cute.cosize(dQ_smem_layout_staged)],
+                cute.struct.MemRange[self.acc_dtype, dQ_smem_size],
                 self.buffer_align_bytes,
             ]
 
@@ -728,7 +762,7 @@ class HSTUAttentionBackwardSm100:
             tma_reduce_op,
             dQ_acc,
             dQ_smem_layout,
-            (self.tile_m, 32),
+            (self.dq_tile_m, 32),
         )
 
         TileScheduler = QMajorBwdScheduler if self.use_q_major_scheduler else SingleTileBwdScheduler
@@ -925,6 +959,7 @@ class HSTUAttentionBackwardSm100:
             if n_block * self.tile_n * self.cta_group_size >= seqlen_k or seqlen_q == 0:
                 cute.arch.nvvm.exit()
 
+        tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if warp_idx == self.load_warp_id:
@@ -945,6 +980,11 @@ class HSTUAttentionBackwardSm100:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(self.use_q1_small_mma):
+            sdST_raw = storage.sdST.get_tensor(cute.make_layout((cute.cosize(dST_smem_layout_staged),)))
+            for value_idx in cutlass.range(tidx, cute.size(sdST_raw), self.threads_per_cta, unroll=1):
+                sdST_raw[value_idx] = self.element_dtype(0.0)
+            self.cta_sync_barrier.arrive_and_wait()
         dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr.ptr
         dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr.ptr
         if cutlass.const_expr(self.use_2cta_instrs):
@@ -1050,8 +1090,11 @@ class HSTUAttentionBackwardSm100:
                 KT_smem_layout_staged.outer,
             )
         sdS = storage.sdS.get_tensor(dS_smem_layout_staged.outer, swizzle=dS_smem_layout_staged.inner)
-        sdST_ptr = cute.recast_ptr(sdS.iterator, dST_smem_layout_staged.inner)
-        sdST = cute.make_tensor(sdST_ptr, dST_smem_layout_staged.outer)
+        if cutlass.const_expr(self.use_q1_small_mma):
+            sdST = storage.sdST.get_tensor(dST_smem_layout_staged.outer, swizzle=dST_smem_layout_staged.inner)
+        else:
+            sdST_ptr = cute.recast_ptr(sdS.iterator, dST_smem_layout_staged.inner)
+            sdST = cute.make_tensor(sdST_ptr, dST_smem_layout_staged.outer)
         sdS_xchg = None
         if cutlass.const_expr(self.use_2cta_instrs):
             sdS_xchg = storage.sdS_xchg.get_tensor(cute.make_layout((self.tile_n, self.tile_m // 2)))
@@ -1210,11 +1253,39 @@ class HSTUAttentionBackwardSm100:
         elif warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
             tmem.wait_for_alloc()
+            tSTtST_compute = tSTtST
+            tdPTtdPT_compute = tdPTtdPT
+            tdVrP_compute = tdVrP
+            tdKtdK_compute = tdKtdK
+            tdVtdV_compute = tdVtdV
+            if cutlass.const_expr(self.use_q1_small_mma):
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                tSTtST_compute = cute.make_tensor(
+                    tmem_ptr + self.tmem_S_offset,
+                    tSTtST.layout,
+                )
+                tdPTtdPT_compute = cute.make_tensor(
+                    tmem_ptr + self.tmem_dP_offset,
+                    tdPTtdPT.layout,
+                )
+                tdVrP_compute = cute.make_tensor(
+                    cute.recast_ptr(tSTtST_compute.iterator, dtype=self.element_dtype),
+                    tdVrP.layout,
+                )
+                tdKtdK_compute = cute.make_tensor(
+                    tmem_ptr + self.tmem_dK_offset,
+                    tdKtdK.layout,
+                )
+                tdVtdV_compute = cute.make_tensor(
+                    tmem_ptr + self.tmem_dV_offset,
+                    tdVtdV.layout,
+                )
             self.compute_persistent(
-                tSTtST,
-                tdPTtdPT,
-                tdVrP,
+                tSTtST_compute,
+                tdPTtdPT_compute,
+                tdVrP_compute,
                 sdS,
+                sdST,
                 sdS_xchg,
                 dS_cluster_full_mbar_ptr,
                 dK,
@@ -1226,8 +1297,8 @@ class HSTUAttentionBackwardSm100:
                 dKV_r2s_copy,
                 sdK_epi,
                 sdV_epi,
-                tdKtdK,
-                tdVtdV,
+                tdKtdK_compute,
+                tdVtdV_compute,
                 thr_mma_S,
                 thr_mma_dV,
                 thr_mma_dK,
@@ -1258,9 +1329,16 @@ class HSTUAttentionBackwardSm100:
             else:
                 cute.arch.warpgroup_reg_alloc(self.num_regs_reduce)
             tmem.wait_for_alloc()
+            tdQtdQ_reduce = tdQtdQ
+            if cutlass.const_expr(self.use_q1_small_mma):
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                tdQtdQ_reduce = cute.make_tensor(
+                    tmem_ptr + self.tmem_dQ_offset,
+                    tdQtdQ.layout,
+                )
             self.reduce_persistent(
                 thr_mma_dQ,
-                tdQtdQ,
+                tdQtdQ_reduce,
                 tma_atom_dQ_acc,
                 tma_tensor_dQ_acc,
                 dQ_acc,
@@ -1283,19 +1361,55 @@ class HSTUAttentionBackwardSm100:
             tmem.allocate(self.tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tSTtST_mma = tSTtST
+            tdPTtdPT_mma = tdPTtdPT
+            tdS_mma = tdS
+            tdVtdV_mma = tdVtdV
+            tdVrP_mma = tdVrP
+            tdQtdQ_mma = tdQtdQ
+            tdKtdK_mma = tdKtdK
+            if cutlass.const_expr(self.use_q1_small_mma):
+                tSTtST_mma = cute.make_tensor(
+                    tmem_ptr + self.tmem_S_offset,
+                    tSTtST.layout,
+                )
+                tdPTtdPT_mma = cute.make_tensor(
+                    tmem_ptr + self.tmem_dP_offset,
+                    tdPTtdPT.layout,
+                )
+                tdS_mma = cute.make_tensor(
+                    cute.recast_ptr(tdPTtdPT_mma.iterator, dtype=self.element_dtype),
+                    tdS.layout,
+                )
+                tdVtdV_mma = cute.make_tensor(
+                    tmem_ptr + self.tmem_dV_offset,
+                    tdVtdV.layout,
+                )
+                tdVrP_mma = cute.make_tensor(
+                    cute.recast_ptr(tSTtST_mma.iterator, dtype=self.element_dtype),
+                    tdVrP.layout,
+                )
+                tdQtdQ_mma = cute.make_tensor(
+                    tmem_ptr + self.tmem_dQ_offset,
+                    tdQtdQ.layout,
+                )
+                tdKtdK_mma = cute.make_tensor(
+                    tmem_ptr + self.tmem_dK_offset,
+                    tdKtdK.layout,
+                )
             self.mma_persistent(
                 tiled_mma_S,
                 tiled_mma_dP,
                 tiled_mma_dV,
                 tiled_mma_dQ,
                 tiled_mma_dK,
-                tSTtST,
-                tdPTtdPT,
-                tdS,
-                tdVtdV,
-                tdVrP,
-                tdQtdQ,
-                tdKtdK,
+                tSTtST_mma,
+                tdPTtdPT_mma,
+                tdS_mma,
+                tdVtdV_mma,
+                tdVrP_mma,
+                tdQtdQ_mma,
+                tdKtdK_mma,
                 sK,
                 sQ,
                 sV,
@@ -2386,8 +2500,14 @@ class HSTUAttentionBackwardSm100:
         tdPTrV = tiled_mma_dP.make_fragment_A(sV)
         tdPTrdO = tiled_mma_dP.make_fragment_B(sdO)
         tdVrdOT = tiled_mma_dV.make_fragment_B(sdOT)
-        tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
-        tdQrKT = tiled_mma_dQ.make_fragment_B(sKT)
+        if cutlass.const_expr(self.use_q1_small_mma):
+            # qlen=1: compute dQ^T = K^T @ dS^T as a 128x8x128 GEMM.
+            # sKT and sdS are transposed SMEM views of the existing buffers.
+            tdQrKT = tiled_mma_dQ.make_fragment_A(sKT)
+            tdQrdS = tiled_mma_dQ.make_fragment_B(sdS)
+        else:
+            tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
+            tdQrKT = tiled_mma_dQ.make_fragment_B(sKT)
         tdKrdST = tiled_mma_dK.make_fragment_A(sdST)
         tdKrQT = tiled_mma_dK.make_fragment_B(sQT)
 
@@ -2422,15 +2542,27 @@ class HSTUAttentionBackwardSm100:
             sB=sdOT,
             cta_group=self.cta_group_size,
         )
-        mma_dsk = partial(
-            hstu_sm100_utils.gemm_w_idx,
-            tiled_mma_dQ,
-            tdQtdQ,
-            tdQrdS,
-            tdQrKT,
-            A_idx=0,
-            num_unroll_groups=1,
-        )
+        if cutlass.const_expr(self.use_q1_small_mma):
+            mma_dsk = partial(
+                hstu_sm100_utils.gemm_w_idx,
+                tiled_mma_dQ,
+                tdQtdQ,
+                tdQrKT,
+                tdQrdS,
+                A_idx=0,
+                B_idx=0,
+                num_unroll_groups=1,
+            )
+        else:
+            mma_dsk = partial(
+                hstu_sm100_utils.gemm_w_idx,
+                tiled_mma_dQ,
+                tdQtdQ,
+                tdQrdS,
+                tdQrKT,
+                A_idx=0,
+                num_unroll_groups=1,
+            )
         mma_dsq = partial(
             hstu_sm100_utils.gemm_ptx_w_idx,
             tiled_mma_dK,
@@ -2576,15 +2708,29 @@ class HSTUAttentionBackwardSm100:
                     load_mma_Q_pipeline.consumer_release(load_mma_Q_release_state)
                     load_mma_Q_release_state.advance()
 
-                    mma_dsk(
-                        B_idx=k_stage,
-                        zero_init=True,
-                    )
-                    mma_reduce_dQ_pipeline.sync_object_full.arrive(
-                        0,
-                        mma_reduce_dQ_pipeline.producer_mask,
-                        mma_reduce_dQ_pipeline.cta_group,
-                    )
+                    if cutlass.const_expr(self.use_q1_small_mma):
+                        mma_dsk(zero_init=True)
+                    else:
+                        mma_dsk(
+                            B_idx=k_stage,
+                            zero_init=True,
+                        )
+                    if cutlass.const_expr(self.use_q1_small_mma):
+                        # The reduced dQ tile is consumed from TMEM immediately.
+                        # Tie the full-barrier arrival to UMMA completion instead
+                        # of merely ordering a software mbarrier arrival after the
+                        # instruction issue.
+                        mma_reduce_dQ_pipeline.sync_object_full.arrive_tcgen05mma(
+                            0,
+                            mma_reduce_dQ_pipeline.producer_mask,
+                            mma_reduce_dQ_pipeline.cta_group,
+                        )
+                    else:
+                        mma_reduce_dQ_pipeline.sync_object_full.arrive(
+                            0,
+                            mma_reduce_dQ_pipeline.producer_mask,
+                            mma_reduce_dQ_pipeline.cta_group,
+                        )
                     compute_mma_dS_pipeline.sync_object_empty.arrive(
                         0,
                         compute_mma_dS_pipeline.consumer_mask,
@@ -2661,17 +2807,33 @@ class HSTUAttentionBackwardSm100:
                 )
                 producer_phase_dKV ^= 1
 
-                mma_dsk(
-                    B_idx=k_stage,
-                    zero_init=True,
-                )
-                mma_reduce_dQ_pipeline.sync_object_full.arrive(
-                    0,
-                    mma_reduce_dQ_pipeline.producer_mask,
-                    mma_reduce_dQ_pipeline.cta_group,
-                )
+                if cutlass.const_expr(self.use_q1_small_mma):
+                    mma_dsk(zero_init=True)
+                else:
+                    mma_dsk(
+                        B_idx=k_stage,
+                        zero_init=True,
+                    )
+                if cutlass.const_expr(self.use_q1_small_mma):
+                    mma_reduce_dQ_pipeline.sync_object_full.arrive_tcgen05mma(
+                        0,
+                        mma_reduce_dQ_pipeline.producer_mask,
+                        mma_reduce_dQ_pipeline.cta_group,
+                    )
+                else:
+                    mma_reduce_dQ_pipeline.sync_object_full.arrive(
+                        0,
+                        mma_reduce_dQ_pipeline.producer_mask,
+                        mma_reduce_dQ_pipeline.cta_group,
+                    )
                 load_mma_Q_pipeline.consumer_release(load_mma_Q_release_state)
                 load_mma_Q_release_state.advance()
+                if cutlass.const_expr(self.use_q1_small_mma):
+                    producer_phase_dQ ^= 1
+                    mma_reduce_dQ_pipeline.sync_object_empty.wait(
+                        0,
+                        producer_phase_dQ,
+                    )
                 if cutlass.const_expr(self.use_q_major_scheduler):
                     load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
                     load_mma_K_consumer_state.advance()
@@ -2680,7 +2842,8 @@ class HSTUAttentionBackwardSm100:
                     compute_mma_dS_pipeline.consumer_mask,
                     compute_mma_dS_pipeline.cta_group,
                 )
-                producer_phase_dQ ^= 1
+                if cutlass.const_expr(not self.use_q1_small_mma):
+                    producer_phase_dQ ^= 1
                 consumer_phase_dS ^= 1
 
             work_tile = tile_scheduler.advance_to_next_work()
@@ -3340,6 +3503,7 @@ class HSTUAttentionBackwardSm100:
         tdPTtdPT: cute.Tensor,
         tdVrP: cute.Tensor,
         sdS: cute.Tensor,
+        sdST: cute.Tensor,
         sdS_xchg: Optional[cute.Tensor],
         dS_cluster_full_mbar_ptr: cute.Pointer,
         dK: cute.Tensor,
@@ -3441,6 +3605,7 @@ class HSTUAttentionBackwardSm100:
                         tdPTtdPT,
                         tdVrP,
                         sdS,
+                        sdST,
                         sdS_xchg,
                         dS_cluster_full_mbar_ptr,
                         dK,
@@ -3491,6 +3656,7 @@ class HSTUAttentionBackwardSm100:
         tdPTtdPT: cute.Tensor,
         tdVrP: cute.Tensor,
         sdS: cute.Tensor,
+        sdST: cute.Tensor,
         sdS_xchg: Optional[cute.Tensor],
         dS_cluster_full_mbar_ptr: cute.Pointer,
         dK: cute.Tensor,
@@ -3776,6 +3942,7 @@ class HSTUAttentionBackwardSm100:
                 tTR_tdPT=tTR_tdPT,
                 tTR_rdPT=tTR_rdPT,
                 sdS=sdS,
+                sdST=sdST,
                 dp_idx=dp_idx,
                 tTR_cdPT_p=tTR_cdPT_p,
                 num_warp_groups=num_warp_groups,
@@ -4006,6 +4173,7 @@ class HSTUAttentionBackwardSm100:
         tTR_tdPT: cute.Tensor,
         tTR_rdPT: cute.Tensor,
         sdS: cute.Tensor,
+        sdST: cute.Tensor,
         dp_idx: Int32,
         tTR_cdPT_p: cute.Tensor,
         num_warp_groups: Int32,
@@ -4232,7 +4400,7 @@ class HSTUAttentionBackwardSm100:
                 compute_mma_dS_producer_state.index,
             ]
             thread_layout = cute.make_ordered_layout(
-                (128, 128),
+                (self.tile_n, self.tile_m),
                 (1, 0),
             )
             sdS_slice_tmp = cute.composition(
@@ -4248,6 +4416,13 @@ class HSTUAttentionBackwardSm100:
                 num_warp_groups,
                 wg_idx,
             )
+            tTR_cdPT_direct = tTR_cdPT_p
+            if cutlass.const_expr(self.use_q1_small_mma):
+                tTR_cdPT_direct = split_wg(
+                    tTR_cdPT_p,
+                    num_warp_groups,
+                    wg_idx,
+                )
             num_stages = cute.size(tTR_rST, mode=[2])
             for stage in cutlass.range_constexpr(num_stages):
                 tTR_rST_cur = tTR_rST[None, 0, stage]
@@ -4279,10 +4454,19 @@ class HSTUAttentionBackwardSm100:
                     tTR_rdPT_cur,
                     4,
                 )
-                cute.autovec_copy(
-                    tTR_rdST_cur,
-                    sdS_slice[None, 0, stage],
-                )
+                if cutlass.const_expr(self.use_q1_small_mma):
+                    dS_stage = compute_mma_dS_producer_state.index
+                    tTR_cdPT_cur = tTR_cdPT_direct[None, 0, stage]
+                    kv_idx = cute.get(tTR_cdPT_cur[0], mode=[0])
+                    sdST[(kv_idx, 0), 0, 0, dS_stage] = tTR_rdST_cur[0]
+                    # The N=8 MN-major dS^T view packs K in 16-element
+                    # groups, so it cannot alias the N=16 dK operand.
+                    sdS[(0, kv_idx % 16), 0, kv_idx // 16, dS_stage] = tTR_rdST_cur[0]
+                else:
+                    cute.autovec_copy(
+                        tTR_rdST_cur,
+                        sdS_slice[None, 0, stage],
+                    )
         else:
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
             for i in cutlass.range_constexpr(
@@ -4300,6 +4484,13 @@ class HSTUAttentionBackwardSm100:
                 )
             tTR_rdST = self.quantize(tTR_rdPT, 4)
 
+        if cutlass.const_expr(self.use_q1_small_mma):
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
+            self.compute_sync_barrier.arrive_and_wait()
+
         # Release dP
         cute.arch.fence_view_async_tmem_load()
         if cutlass.const_expr(self.use_2cta_instrs):
@@ -4311,14 +4502,15 @@ class HSTUAttentionBackwardSm100:
 
         if cutlass.const_expr(not self.use_2cta_instrs):
             if cutlass.const_expr(not use_stagewise_1cta):
-                sdS_slice = sdS[
+                dS_output = sdST if self.use_q1_small_mma else sdS
+                sdS_slice = dS_output[
                     None,
                     None,
                     None,
                     compute_mma_dS_producer_state.index,
                 ]
                 thread_layout = cute.make_ordered_layout(
-                    (128, 128),
+                    (self.tile_n, self.tile_m),
                     (1, 0),
                 )
                 sdS_slice_tmp = cute.composition(
@@ -4485,9 +4677,8 @@ class HSTUAttentionBackwardSm100:
             pipeline.PipelineUserType.Consumer,
             self.single_stage,
         )
-
         load_op = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tile_m // 4)),
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1 if self.use_q1_small_mma else self.dq_tile_m // 4)),
             self.acc_dtype,
         )
         tdQtdQ = tdQtdQ[(None, None), 0, 0]
@@ -4499,10 +4690,10 @@ class HSTUAttentionBackwardSm100:
         tTR_sdQ = thr_t2r.partition_D(sdQ)
 
         rdQ_acc = cute.make_rmem_tensor(
-            cute.make_layout((self.dQaccum_reduce_stage,)),
+            cute.make_layout((self.qmajor_dq_stages,)),
             self.acc_dtype,
         )
-        for stage_idx in cutlass.range_constexpr(self.dQaccum_reduce_stage):
+        for stage_idx in cutlass.range_constexpr(self.qmajor_dq_stages):
             rdQ_acc[stage_idx] = Float32(0.0)
 
         tile_scheduler = TileSchedulerCls()
@@ -4730,25 +4921,43 @@ class HSTUAttentionBackwardSm100:
         mma_reduce_dQ_pipeline.consumer_release(mma_reduce_dQ_consumer_state)
         mma_reduce_dQ_consumer_state.advance()
 
-        num_reduce_stages = cute.size(tTR_cdQ, mode=[2])
+        num_reduce_stages = self.qmajor_dq_stages if self.use_q1_small_mma else cute.size(tTR_cdQ, mode=[2])
         for stage_idx in cutlass.range(0, num_reduce_stages, unroll_full=True):
-            tTR_rdQ_stage = tTR_rdQ[None, None, stage_idx]
-            tTR_sdQ_stage = tTR_sdQ[None, None, 0, 0]
-            cute.autovec_copy(
-                cute.make_tensor(
-                    tTR_rdQ_stage.iterator,
-                    tTR_sdQ_stage.layout,
-                ),
-                tTR_sdQ_stage,
-            )
+            if cutlass.const_expr(self.use_q1_small_mma):
+                # M128N8 assigns output row `tidx` to reducer thread `tidx`.
+                # Vectorize its eight N values into shared memory; only N=0
+                # is a real query row for the qlen=1 specialization.
+                thread_layout = cute.make_ordered_layout(
+                    (self.tile_hdim, self.mma_tiler_dsk[1]),
+                    (0, 1),
+                )
+                sdQ_slice_tmp = cute.composition(sdQ[None, None, 0], thread_layout)
+                sdQ_slice = cute.composition(
+                    sdQ_slice_tmp[tidx, None],
+                    cute.make_layout(tTR_cdQ.shape),
+                )
+                cute.autovec_copy(tTR_rdQ, sdQ_slice)
+            else:
+                tTR_rdQ_stage = tTR_rdQ[None, None, stage_idx]
+                tTR_sdQ_stage = tTR_sdQ[None, None, 0, 0]
+                cute.autovec_copy(
+                    cute.make_tensor(
+                        tTR_rdQ_stage.iterator,
+                        tTR_sdQ_stage.layout,
+                    ),
+                    tTR_sdQ_stage,
+                )
             cute.arch.fence_proxy(
                 "async.shared",
                 space="cta",
             )
             self.reduce_sync_barrier.arrive_and_wait()
 
-            if tidx < self.dQ_reduce_ncol_t2r:
-                rdQ_acc[stage_idx] += sdQ[0, tidx, 0]
+            if tidx < self.qmajor_dq_ncol:
+                if cutlass.const_expr(self.use_q1_small_mma):
+                    rdQ_acc[stage_idx] += sdQ[tidx, 0, 0]
+                else:
+                    rdQ_acc[stage_idx] += sdQ[0, tidx, 0]
 
             # All readers must finish before the next TMEM slice reuses sdQ.
             self.reduce_sync_barrier.arrive_and_wait()
@@ -4773,9 +4982,9 @@ class HSTUAttentionBackwardSm100:
             dQ,
         )
         dQ_row = dQ_item[0, None, ((0, 0), 0)]
-        if tidx < self.dQ_reduce_ncol_t2r:
-            for stage_idx in cutlass.range_constexpr(self.dQaccum_reduce_stage):
-                dim_idx = stage_idx * self.dQ_reduce_ncol_t2r + tidx
+        if tidx < self.qmajor_dq_ncol:
+            for stage_idx in cutlass.range_constexpr(self.qmajor_dq_stages):
+                dim_idx = stage_idx * self.qmajor_dq_ncol + tidx
                 dQ_row[dim_idx] = dQ.element_type(rdQ_acc[stage_idx] * dQ_scale)
 
     @cute.jit
