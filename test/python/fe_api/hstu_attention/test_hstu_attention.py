@@ -1518,20 +1518,6 @@ def test_d128_single_query_direct_backward_matches_pytorch():
     alpha = 0.7
     scaling_seqlen = 256.0
 
-    q_ref = q.float().detach().requires_grad_(True)
-    k_ref = k.float().detach().requires_grad_(True)
-    v_ref = v.float().detach().requires_grad_(True)
-    out_ref = _reference_forward(
-        q_ref,
-        k_ref,
-        v_ref,
-        cu_q,
-        cu_k,
-        alpha=alpha,
-        scaling_seqlen=scaling_seqlen,
-        causal=True,
-    )
-    expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.float())
     actual = hstu_attention_backward(
         do,
         q,
@@ -1545,10 +1531,26 @@ def test_d128_single_query_direct_backward_matches_pytorch():
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
     )
+    torch.cuda.synchronize()
+
+    q_ref = q.cpu().float().requires_grad_(True)
+    k_ref = k.cpu().float().requires_grad_(True)
+    v_ref = v.cpu().float().requires_grad_(True)
+    out_ref = _reference_forward(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
 
     assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
-        torch.testing.assert_close(actual[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
+        torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.L1
