@@ -407,7 +407,8 @@ def hstu_varlen_bwd_100(
     assert v.shape[2] == head_dim, "v and q must have the same head_dim"
     assert do.shape == q.shape, "do and q must have the same shape"
 
-    m_block_size = 128
+    is_q_len_one_d128 = max_seqlen_q == 1 and head_dim == 128
+    m_block_size = 64 if is_q_len_one_d128 else 128
     n_block_size = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
@@ -415,7 +416,7 @@ def hstu_varlen_bwd_100(
     is_local = (window_size_left < max_seqlen_k or window_size_right < max_seqlen_k) and not is_causal
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
-    use_2cta_instrs = head_dim == 128 and not is_arbitrary
+    use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_d128
     if head_dim == 256:
         # The fused one-CTA kernel's live TMEM ranges exceed the SM100
         # 512-column capacity at D=256. Use the dedicated two-kernel path:
