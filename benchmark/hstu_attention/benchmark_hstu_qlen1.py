@@ -385,7 +385,26 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
-    parser.add_argument("--forward-impl", choices=("auto", "dispatch", "tc", "tc-split2", "tc-split4"), default="auto")
+    parser.add_argument(
+        "--forward-impl",
+        choices=(
+            "auto",
+            "dispatch",
+            "tc",
+            "tc-split2",
+            "tc-split4",
+            "tc-m64",
+            "tc-m64-split2",
+            "tc-m64-split4",
+            "tc-m64-n64",
+            "tc-m64-n64-split2",
+            "tc-m64-n64-split4",
+            "tc-epi1",
+            "tc-epi1-split2",
+            "tc-epi1-split4",
+        ),
+        default="auto",
+    )
     parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "tc-small", "legacy"), default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)

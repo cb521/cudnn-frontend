@@ -13,6 +13,7 @@ import cutlass
 import cutlass.pipeline
 import cutlass.cute as cute
 from cutlass import const_expr
+from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.typing import Int32, Float32, Boolean
@@ -56,6 +57,52 @@ def _atomic_add_bf16x2(ptr, val_lo: Float32, val_hi: Float32, *, loc=None, ip=No
     )
 
 
+@cute.jit
+def _tmem_load_32dp32b32x(tmem_addr: Int32):
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 32),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.sync.aligned.32x32b.x32.b32 "
+        "{$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, "
+        "$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, [$32];",
+        ",".join(["=r"] * 32 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(32))
+
+
+@cute.jit
+def _cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(b).ir_value(), Float32(a).ir_value()],
+            "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _tmem_store_bf16x16(tmem_addr: Int32, vals: cute.Tensor):
+    assert cute.size(vals) == 16
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()] + [Int32(vals[i]).ir_value() for i in range(16)],
+        "tcgen05.st.sync.aligned.32x32b.x16.b32 "
+        "[$0], {$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16};",
+        ",".join(["r"] * 17),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 class HSTUAttentionForwardSm100:
     arch = 100
 
@@ -81,6 +128,7 @@ class HSTUAttentionForwardSm100:
         use_2cta_instrs: bool = False,
         is_q_len_one: bool = False,
         q1_split_kv: int = 1,
+        q1_single_warp_epilogue: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -92,8 +140,10 @@ class HSTUAttentionForwardSm100:
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
         self.q1_split_kv = q1_split_kv
+        self.q1_single_warp_epilogue = q1_single_warp_epilogue
         assert q1_split_kv in (1, 2, 4)
         assert q1_split_kv == 1 or is_q_len_one
+        assert not q1_single_warp_epilogue or is_q_len_one
         self.use_2cta_instrs = (
             use_2cta_instrs
             and q1_split_kv == 1
@@ -2704,17 +2754,21 @@ class HSTUAttentionForwardSm100:
         tStP_layout = cute.composition(tStSi.layout, cute.make_layout((self.kBlockM, tilePlikeFP32)))
         tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            Float32,
+        tmem_load_op = (
+            tcgen05.copy.Ld16x64bOp(tcgen05.copy.Repetition(16))
+            if const_expr(self.kBlockM == 64)
+            else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
         )
+        tmem_load_atom = cute.make_copy_atom(tmem_load_op, Float32)
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tStSi)
 
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
-            Float32,
+        tmem_store_op = (
+            tcgen05.copy.St16x64bOp(tcgen05.copy.Repetition(8))
+            if const_expr(self.kBlockM == 64)
+            else tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16))
         )
+        tmem_store_atom = cute.make_copy_atom(tmem_store_op, Float32)
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
         thr_tmem_store = tiled_tmem_store.get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
@@ -2794,6 +2848,7 @@ class HSTUAttentionForwardSm100:
             silu_step = partial(
                 self.silu_step,
                 fastsilu=fastsilu,
+                seqlen_k=seqlen.seqlen_k,
                 mbar_ptr=mbar_ptr,
                 mbar_s0_s1_sequence_offset=mbar_s0_s1_sequence_offset,
                 thr_mma_qk=thr_mma_qk,
@@ -2939,12 +2994,60 @@ class HSTUAttentionForwardSm100:
             )
 
     @cute.jit
+    def _silu_step_q1_m64(
+        self,
+        mma_si_consumer_phase: Int32,
+        s0_s1_sequence_phase: Int32,
+        n_block: Int32,
+        fastsilu: FastSilU,
+        seqlen_k: Int32,
+        mbar_ptr: cute.Pointer,
+        stage: int | Int32,
+    ):
+        """Convert one M64 score row-group to BF16 P with the native 32-DP TMEM mapping."""
+        assert self.kBlockM == 64 and self.kBlockN in (64, 128)
+        assert not self.use_2cta_instrs
+
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_S_full_offset + stage,
+            mma_si_consumer_phase,
+        )
+        scores = cute.make_rmem_tensor((self.kBlockN,), Float32)
+        for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+            values = _tmem_load_32dp32b32x(Int32(self.tmem_s_offset[stage] + chunk * 32))
+            for i in cutlass.range_constexpr(32):
+                scores[chunk * 32 + i] = values[i]
+        cute.arch.fence_view_async_tmem_load()
+
+        valid_cols = min(max(seqlen_k - n_block * self.kBlockN, 0), self.kBlockN)
+        for i in cutlass.range_constexpr(self.kBlockN):
+            scores[i] = scores[i] if i < valid_cols else Float32(0.0)
+        converted = cute.make_rmem_tensor((self.kBlockN,), self.q_dtype)
+        fastsilu.silu_x2(scores, converted, None)
+
+        packed = cute.make_rmem_tensor((16,), Int32)
+        for chunk in cutlass.range_constexpr(self.kBlockN // 32):
+            for i in cutlass.range_constexpr(16):
+                packed[i] = _cvt_f32x2_to_bf16x2(scores[chunk * 32 + i * 2], scores[chunk * 32 + i * 2 + 1])
+            _tmem_store_bf16x16(Int32(self.tmem_p_offset[stage] + chunk * 16), packed)
+            if const_expr((chunk + 1) * 32 == self.split_P_arrive):
+                cute.arch.fence_view_async_tmem_store()
+                if const_expr(self.s0_s1_barrier):
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_s0_s1_sequence_offset + (1 - stage))
+                cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        return mma_si_consumer_phase ^ 1, s0_s1_sequence_phase ^ 1
+
+    @cute.jit
     def silu_step(
         self,
         mma_si_consumer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         n_block: Int32,
         fastsilu: FastSilU,
+        seqlen_k: Int32,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
         thr_mma_qk: cute.core.ThrMma,
@@ -2968,6 +3071,17 @@ class HSTUAttentionForwardSm100:
         4. Coordinating pipeline synchronization between different processing stages
         """
         assert mask_fn is None or r2p_mask_fn is None, "scalar and R2P masks are mutually exclusive"
+
+        if const_expr(self.kBlockM == 64):
+            return self._silu_step_q1_m64(
+                mma_si_consumer_phase,
+                s0_s1_sequence_phase,
+                n_block,
+                fastsilu,
+                seqlen_k,
+                mbar_ptr,
+                stage,
+            )
 
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
@@ -3114,7 +3228,11 @@ class HSTUAttentionForwardSm100:
         )
         tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
         thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-        smem_copy_atom = sm100_utils_basic.get_smem_store_op(self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load)
+        smem_copy_atom = (
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.o_dtype)
+            if const_expr(self.kBlockM == 64)
+            else sm100_utils_basic.get_smem_store_op(self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load)
+        )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_r2s = utils.partition_D_position_independent(
@@ -3137,28 +3255,30 @@ class HSTUAttentionForwardSm100:
                     mbar_ptr + self.mbar_O_full_offset + stage,
                     epi_consumer_phase,
                 )
-        for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
-            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-            tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
-            tOrO_frg_cvt = cute.make_rmem_tensor(
-                tOsO_r2s[None, 0, 0, i].shape,
-                self.o_dtype,
-            )
-            if has_work:
-                tOrO_frg = cute.make_rmem_tensor(
+        participates = tidx < cute.arch.WARP_SIZE if const_expr(self.kBlockM == 64 or self.q1_single_warp_epilogue) else True
+        if participates:
+            for i in cutlass.range_constexpr(self.head_dim_v_padded // async_copy_elems):
+                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+                tOsO_r2s_i = tOsO_r2s[None, 0, 0, i]
+                tOrO_frg_cvt = cute.make_rmem_tensor(
                     tOsO_r2s[None, 0, 0, i].shape,
-                    self.pv_acc_dtype,
+                    self.o_dtype,
                 )
-                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-                for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
-                    tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
-                        (tOrO_frg[j], tOrO_frg[j + 1]),
-                        (scale, scale),
+                if has_work:
+                    tOrO_frg = cute.make_rmem_tensor(
+                        tOsO_r2s[None, 0, 0, i].shape,
+                        self.pv_acc_dtype,
                     )
-                tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
-            else:
-                tOrO_frg_cvt.fill(0)
-            cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
+                    cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                    for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
+                        tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                            (tOrO_frg[j], tOrO_frg[j + 1]),
+                            (scale, scale),
+                        )
+                    tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
+                else:
+                    tOrO_frg_cvt.fill(0)
+                cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
 
         if const_expr(self.use_2cta_instrs):
             if has_work:

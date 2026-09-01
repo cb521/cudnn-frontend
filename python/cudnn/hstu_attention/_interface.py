@@ -333,8 +333,17 @@ def hstu_varlen_fwd_100(
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
     is_q_len_one = max_seqlen_q == 1
-    kBlockM = 128
-    kBlockN = 128
+    q1_m64_algorithm = _q1_fwd_algorithm in (
+        "tc-m64",
+        "tc-m64-split2",
+        "tc-m64-split4",
+        "tc-m64-n64",
+        "tc-m64-n64-split2",
+        "tc-m64-n64-split4",
+    )
+    q1_single_warp_epilogue = _q1_fwd_algorithm in ("tc-epi1", "tc-epi1-split2", "tc-epi1-split4")
+    kBlockM = 64 if q1_m64_algorithm else 128
+    kBlockN = 64 if "m64-n64" in _q1_fwd_algorithm else 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
@@ -354,8 +363,19 @@ def hstu_varlen_fwd_100(
         and q.shape[1] == k.shape[1] == v.shape[1]
     )
     capability = _get_q1_device_capability(q.device)
+    q1_split_algorithm = {
+        "tc-m64": "tc",
+        "tc-m64-split2": "tc-split2",
+        "tc-m64-split4": "tc-split4",
+        "tc-m64-n64": "tc",
+        "tc-m64-n64-split2": "tc-split2",
+        "tc-m64-n64-split4": "tc-split4",
+        "tc-epi1": "tc",
+        "tc-epi1-split2": "tc-split2",
+        "tc-epi1-split4": "tc-split4",
+    }.get(_q1_fwd_algorithm, _q1_fwd_algorithm)
     q1_split_kv = _select_q1_fwd_split_kv(
-        _q1_fwd_algorithm,
+        q1_split_algorithm,
         capability,
         batch_size,
         k.shape[0] // max(batch_size, 1),
@@ -366,6 +386,8 @@ def hstu_varlen_fwd_100(
     use_2cta_instrs = (
         (not is_q_len_one or batch_size < 256)
         and q1_split_kv == 1
+        and kBlockM == 128
+        and not q1_single_warp_epilogue
         and capability == (10, 7)
         and head_dim == 128
         and is_causal
@@ -396,10 +418,24 @@ def hstu_varlen_fwd_100(
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
-    if _q1_fwd_algorithm not in ("auto", "tc", "tc-split2", "tc-split4"):
+    if _q1_fwd_algorithm not in (
+        "auto",
+        "tc",
+        "tc-split2",
+        "tc-split4",
+        "tc-m64",
+        "tc-m64-split2",
+        "tc-m64-split4",
+        "tc-m64-n64",
+        "tc-m64-n64-split2",
+        "tc-m64-n64-split4",
+        "tc-epi1",
+        "tc-epi1-split2",
+        "tc-epi1-split4",
+    ):
         raise ValueError(f"Unsupported qlen=1 forward algorithm: {_q1_fwd_algorithm}")
-    if _q1_fwd_algorithm in ("tc-split2", "tc-split4") and not q1_split_supported:
-        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
+    if (q1_split_kv > 1 or q1_m64_algorithm or q1_single_warp_epilogue) and not q1_split_supported:
+        raise ValueError("The specialized qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
     compile_key = (
         q.device,
         q_dtype,
@@ -415,6 +451,7 @@ def hstu_varlen_fwd_100(
         use_2cta_instrs,
         use_clc_descriptor,
         q1_split_kv,
+        q1_single_warp_epilogue,
     )
 
     block_sparse_tensors = None
@@ -477,6 +514,7 @@ def hstu_varlen_fwd_100(
             use_clc_descriptor=use_clc_descriptor,
             is_q_len_one=is_q_len_one and not use_2cta_instrs,
             q1_split_kv=q1_split_kv,
+            q1_single_warp_epilogue=q1_single_warp_epilogue,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
