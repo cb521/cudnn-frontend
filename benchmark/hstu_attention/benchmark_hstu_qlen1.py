@@ -5,9 +5,10 @@
 
 The default cases model the target decode-like workload: H=4, D=128, every
 sequence has one query, and per-sequence KV lengths vary around 2K tokens.
-Both explicit APIs use preallocated public outputs. Backward timing includes
-the internal dQ accumulation workspace and conversion kernel because those are
-part of the current HSTU execution path.
+Both explicit APIs use preallocated public outputs. Backward timing covers all
+GPU work issued by the selected implementation: ``legacy`` includes its dQ
+workspace zeroing and conversion, while ``direct`` and ``tc`` write dQ once
+without those extra launches.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import torch.nn.functional as F
 
 import cudnn
 from cudnn import HSTUBwdSm100, HSTUFwdSm100
-
+from cudnn.hstu_attention import _interface
 
 _KV_LENGTH_PATTERN = (1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072)
 
@@ -66,12 +67,15 @@ def _make_inputs(
     generator.manual_seed(seed)
 
     def randn(tokens: int) -> torch.Tensor:
-        return torch.randn(
-            (tokens, heads, head_dim),
-            dtype=dtype,
-            device=device,
-            generator=generator,
-        ) * 0.2
+        return (
+            torch.randn(
+                (tokens, heads, head_dim),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            * 0.2
+        )
 
     q = randn(batch_size)
     k = randn(sum(k_lengths))
@@ -181,6 +185,7 @@ def _compile_backward(
     window_size: tuple[int, int],
     alpha: float,
     scaling_seqlen: float,
+    backward_impl: str = "auto",
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], Callable[[], None], float]:
     q = tensors["q"]
     k = tensors["k"]
@@ -195,30 +200,66 @@ def _compile_backward(
     assert isinstance(cu_q, torch.Tensor)
     assert isinstance(cu_k, torch.Tensor)
     dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
-    api = HSTUBwdSm100(
-        sample_do=do,
-        sample_q=q,
-        sample_k=k,
-        sample_v=v,
-        sample_dq=dq,
-        sample_dk=dk,
-        sample_dv=dv,
-        sample_cu_seqlens_q=cu_q,
-        sample_cu_seqlens_k=cu_k,
-        max_seqlen_q=1,
-        max_seqlen_k=max_k,
-        window_size=window_size,
-        alpha=alpha,
-        scaling_seqlen=scaling_seqlen,
-    )
-    api.check_support()
-    start = time.perf_counter()
-    api.compile()
-    torch.cuda.synchronize()
-    compile_seconds = time.perf_counter() - start
+    if backward_impl == "auto":
+        api = HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=dq,
+            sample_dk=dk,
+            sample_dv=dv,
+            sample_cu_seqlens_q=cu_q,
+            sample_cu_seqlens_k=cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max_k,
+            window_size=window_size,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )
+        api.check_support()
+        start = time.perf_counter()
+        api.compile()
+        torch.cuda.synchronize()
+        compile_seconds = time.perf_counter() - start
 
-    def run() -> None:
-        api.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k)
+        def run() -> None:
+            api.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k)
+
+    else:
+        call_args = (
+            do,
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            1,
+            max_k,
+            dq,
+            dk,
+            dv,
+            window_size[0],
+            window_size[1],
+            alpha,
+            None,
+            False,
+            scaling_seqlen,
+        )
+        start = time.perf_counter()
+        _interface.hstu_varlen_bwd_100(
+            *call_args,
+            _compile_only=True,
+            _q1_bwd_algorithm=backward_impl,
+        )
+        torch.cuda.synchronize()
+        compile_seconds = time.perf_counter() - start
+
+        def run() -> None:
+            _interface.hstu_varlen_bwd_100(
+                *call_args,
+                _q1_bwd_algorithm=backward_impl,
+            )
 
     return (dq, dk, dv), run, compile_seconds
 
@@ -231,6 +272,8 @@ def _correctness(
     window_size: tuple[int, int],
     alpha: float,
     scaling_seqlen: float,
+    backward_impl: str,
+    direction: str,
 ) -> dict[str, float | bool]:
     tensors = _make_inputs(5, heads, head_dim, 2048, dtype, device, seed=20260901)
     tensors["k_lengths"] = [1, 127, 128, 2049, 3072]
@@ -255,10 +298,21 @@ def _correctness(
     # Compile and execute CuTe before the reference path. Early Rubin systems
     # do not yet support PyTorch's device-code reference toolchain, so the
     # correctness oracle intentionally runs on CPU.
-    actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
-    actual_grads, bwd_run, _ = _compile_backward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
-    fwd_run()
-    bwd_run()
+    actual_out = None
+    actual_grads = None
+    if direction in ("forward", "both"):
+        actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+        fwd_run()
+    if direction in ("backward", "both"):
+        actual_grads, bwd_run, _ = _compile_backward(
+            tensors,
+            max(k_lengths),
+            window_size,
+            alpha,
+            scaling_seqlen,
+            backward_impl,
+        )
+        bwd_run()
     torch.cuda.synchronize()
 
     q_ref = q.cpu().float().requires_grad_(True)
@@ -267,20 +321,22 @@ def _correctness(
     expected_out = _reference_forward(q_ref, k_ref, v_ref, k_lengths, alpha, scaling_seqlen)
     expected_grads = torch.autograd.grad(expected_out, (q_ref, k_ref, v_ref), do.cpu().float())
 
-    actual_out_cpu = actual_out.cpu().float()
-    actual_grads_cpu = [actual.cpu().float() for actual in actual_grads]
-    fwd_error = (actual_out_cpu - expected_out).abs()
-    grad_errors = [(actual - expected).abs() for actual, expected in zip(actual_grads_cpu, expected_grads)]
-    forward_ok = torch.allclose(actual_out_cpu, expected_out, rtol=3.0e-2, atol=3.0e-2)
-    backward_ok = all(torch.allclose(actual, expected, rtol=6.0e-2, atol=6.0e-2) for actual, expected in zip(actual_grads_cpu, expected_grads))
-    return {
-        "forward_ok": bool(forward_ok),
-        "backward_ok": bool(backward_ok),
-        "forward_max_abs": float(fwd_error.max().item()),
-        "dq_max_abs": float(grad_errors[0].max().item()),
-        "dk_max_abs": float(grad_errors[1].max().item()),
-        "dv_max_abs": float(grad_errors[2].max().item()),
-    }
+    result: dict[str, float | bool] = {}
+    if actual_out is not None:
+        actual_out_cpu = actual_out.cpu().float()
+        fwd_error = (actual_out_cpu - expected_out).abs()
+        result["forward_ok"] = bool(torch.allclose(actual_out_cpu, expected_out, rtol=3.0e-2, atol=3.0e-2))
+        result["forward_max_abs"] = float(fwd_error.max().item())
+    if actual_grads is not None:
+        actual_grads_cpu = [actual.cpu().float() for actual in actual_grads]
+        grad_errors = [(actual - expected).abs() for actual, expected in zip(actual_grads_cpu, expected_grads)]
+        result["backward_ok"] = bool(
+            all(torch.allclose(actual, expected, rtol=6.0e-2, atol=6.0e-2) for actual, expected in zip(actual_grads_cpu, expected_grads))
+        )
+        result["dq_max_abs"] = float(grad_errors[0].max().item())
+        result["dk_max_abs"] = float(grad_errors[1].max().item())
+        result["dv_max_abs"] = float(grad_errors[2].max().item())
+    return result
 
 
 def main() -> None:
@@ -292,6 +348,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
+    parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "legacy"), default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--groups", type=int, default=7)
@@ -318,12 +375,23 @@ def main() -> None:
         "average_kv_target": args.average_kv,
         "mask": args.mask,
         "direction": args.direction,
+        "backward_impl": args.backward_impl,
     }
 
     if not args.skip_correctness:
-        correctness = _correctness(args.heads, args.head_dim, dtype, device, window_size, alpha, scaling_seqlen)
+        correctness = _correctness(
+            args.heads,
+            args.head_dim,
+            dtype,
+            device,
+            window_size,
+            alpha,
+            scaling_seqlen,
+            args.backward_impl,
+            args.direction,
+        )
         print("CORRECTNESS " + json.dumps(correctness, sort_keys=True), flush=True)
-        if not correctness["forward_ok"] or not correctness["backward_ok"]:
+        if not all(value for key, value in correctness.items() if key.endswith("_ok")):
             raise AssertionError("HSTU qlen=1 correctness check failed")
         results["correctness"] = correctness
 
@@ -347,7 +415,14 @@ def main() -> None:
                 **_measure_ms(run, args.warmup, args.iterations, args.groups),
             }
         if args.direction in ("backward", "both"):
-            _, run, compile_seconds = _compile_backward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+            _, run, compile_seconds = _compile_backward(
+                tensors,
+                max(k_lengths),
+                window_size,
+                alpha,
+                scaling_seqlen,
+                args.backward_impl,
+            )
             case["backward"] = {
                 "compile_seconds": compile_seconds,
                 **_measure_ms(run, args.warmup, args.iterations, args.groups),

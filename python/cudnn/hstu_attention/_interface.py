@@ -186,13 +186,9 @@ def _hstu_varlen_bwd_q1_direct(
     compile_key = (q.device, q.dtype)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
-            for tensor in (q, k, v, do, dq, dk, dv)
+            _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, do, dq, dk, dv)
         ]
-        cu_q_tensor, cu_k_tensor = [
-            _mark_dynamic_tensor(tensor, tensor.ndim - 1)
-            for tensor in (cu_seqlens_q, cu_seqlens_k)
-        ]
+        cu_q_tensor, cu_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         kernel = HSTUAttentionBackwardQlen1Sm100(
             element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
         )
@@ -468,6 +464,7 @@ def hstu_varlen_bwd_100(
     scaling_seqlen: Optional[float] = None,
     *,
     _compile_only: bool = False,
+    _q1_bwd_algorithm: str = "auto",
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     if deterministic:
@@ -502,24 +499,17 @@ def hstu_varlen_bwd_100(
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
     use_2cta_instrs = head_dim == 128 and not is_arbitrary and not is_q_len_one_d128
-    q1_inputs_direct = all(
-        _supports_bwd_original_qkv_layout(tensor)
-        for tensor in (q, k, v, do)
-    )
+    q1_inputs_direct = all(_supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
     q1_outputs_direct = (dq is None and dk is None and dv is None) or (
-        dq is not None
-        and dk is not None
-        and dv is not None
-        and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
+        dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     )
-    use_q1_direct_kernel = (
-        is_q_len_one_d128
-        and batch_size >= 256
-        and is_causal
-        and not is_arbitrary
-        and q1_inputs_direct
-        and q1_outputs_direct
-    )
+    if _q1_bwd_algorithm not in ("auto", "direct", "tc", "legacy"):
+        raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
+    q1_direct_supported = is_q_len_one_d128 and is_causal and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
+    if _q1_bwd_algorithm in ("direct", "tc") and not q1_direct_supported:
+        raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal D=128 qlen=1 with direct layouts")
+    use_q1_direct_kernel = q1_direct_supported and (_q1_bwd_algorithm == "direct" or (_q1_bwd_algorithm == "auto" and batch_size >= 256))
+    use_q_major_scheduler = _q1_bwd_algorithm == "tc"
     if use_q1_direct_kernel:
         return _hstu_varlen_bwd_q1_direct(
             do,
@@ -609,6 +599,7 @@ def hstu_varlen_bwd_100(
         func_num,
         use_auto_block_metadata,
         use_2cta_instrs,
+        use_q_major_scheduler,
     )
     if _compile_only and compile_key in hstu_varlen_bwd_100.compile_cache:
         if no_preallocated_grads:
@@ -667,7 +658,7 @@ def hstu_varlen_bwd_100(
         dtype=torch.float32,
         device=q.device,
     )
-    if not _compile_only:
+    if not _compile_only and not use_q_major_scheduler:
         workspace_torch.zero_()
     problem_shape = (
         Int32(max_seqlen_q),
@@ -716,6 +707,7 @@ def hstu_varlen_bwd_100(
             func_num=func_num,
             use_auto_block_metadata=use_auto_block_metadata,
             use_2cta_instrs=use_2cta_instrs,
+            use_q_major_scheduler=use_q_major_scheduler,
         )
         with torch.cuda.nvtx.range("hstu_varlen_bwd_kernel"):
             hstu_varlen_bwd_100.compile_cache[compile_key] = cute.compile(

@@ -31,6 +31,56 @@ were run sequentially in the same allocation.
 | 512 | 0.2285 | 0.2249 | 1.02x | 1.0261 | 0.8069 | 1.27x |
 | 1024 | 0.4557 | 0.4322 | 1.05x | 2.0375 | 1.4264 | 1.43x |
 
+## Tensor-core Q-major backward experiment
+
+The benchmark can force three backward implementations with
+`--backward-impl legacy|tc|direct`. `legacy` is the original tensor-core
+schedule, `tc` is the Q-major tensor-core experiment, and `direct` is the
+specialized CUDA-core path used by the production dispatch at batch sizes of
+at least 256. `auto` retains that production dispatch.
+
+The following measurements use the same workload and allocations as above,
+with 10 warmups and the median of five groups of 30 executions.
+
+### B300 (SM10.3)
+
+| Batch | Legacy TC (ms) | Q-major TC (ms) | Q-major vs legacy | Scalar direct (ms) | Direct vs Q-major TC |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.2083 | 0.2548 | 0.82x | 0.3866 | 0.66x |
+| 512 | 1.7138 | 1.4321 | 1.20x | 1.0298 | 1.39x |
+| 1024 | 3.4460 | 2.8148 | 1.22x | 1.8693 | 1.51x |
+
+### Rubin (SM10.7)
+
+| Batch | Legacy TC (ms) | Q-major TC (ms) | Q-major vs legacy | Scalar direct (ms) | Direct vs Q-major TC |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.1301 | 0.1763 | 0.74x | 0.3288 | 0.54x |
+| 512 | 0.9992 | 0.8766 | 1.14x | 0.7644 | 1.15x |
+| 1024 | 2.0010 | 1.7084 | 1.17x | 1.3456 | 1.27x |
+
+The Q-major tensor-core path follows the FA2 `bwd_loop_opt` loop-order idea:
+one CTA owns a batch/head pair, keeps its one Q row fixed, and walks the KV
+tiles. Each KV tile is still evaluated by UMMA. The one valid dQ row is copied
+from TMEM and accumulated in registers across KV tiles, then written once;
+dK and dV are written directly by their owning CTA. This removes the global
+dQ accumulation workspace, workspace zeroing, conversion launch, and global
+dQ reductions from this path.
+
+The experiment improves the old tensor-core path once the batch supplies
+enough batch/head CTAs, but it does not beat the scalar direct kernel. With
+`seqlen_q=1`, an UMMA tile still reserves and evaluates a 128-row Q tile while
+only one row is useful. The direct kernel instead assigns warps to disjoint KV
+rows and computes only the required row. Reducing the tensor-core Q tile to 64
+is not a standalone tuning change: the current dQ MMA/TMEM load mapping assumes
+the 128-row layout and needs a different transposed dQ MMA design. Therefore
+the Q-major tensor-core implementation remains an explicit comparison option,
+and the `auto` policy remains unchanged: legacy at batch 64 and scalar direct
+at batch 512/1024 for the target cases.
+
+The forced `tc` path passes the variable-length oracle on both architectures.
+Maximum absolute `(dQ, dK, dV)` errors are `(9.13e-6, 1.83e-6, 1.45e-6)` on
+B300 and `(6.65e-6, 1.22e-6, 1.04e-6)` on Rubin.
+
 ## Design
 
 The forward kernel uses one Q stage for a one-token query, removing the
