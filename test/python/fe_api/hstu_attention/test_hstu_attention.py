@@ -33,6 +33,7 @@ pytestmark = [
 
 _HAS_CUDA = torch.cuda.is_available()
 _IS_SM10X = _HAS_CUDA and torch.cuda.get_device_capability()[0] == 10
+_IS_Q1_SPLIT_TARGET = _HAS_CUDA and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
 
 
 def _inputs(
@@ -1499,6 +1500,72 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     )
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_grads):
         torch.testing.assert_close(actual_grads[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "batch_size", "average_seqlen_k", "supported", "expected"),
+    (
+        ((10, 3), 64, 2048, True, 4),
+        ((10, 3), 256, 2048, True, 4),
+        ((10, 3), 512, 2048, True, 2),
+        ((10, 3), 1024, 2048, True, 1),
+        ((10, 3), 64, 1024, True, 1),
+        ((10, 7), 64, 2048, True, 4),
+        ((10, 7), 128, 2048, True, 4),
+        ((10, 7), 256, 2048, True, 2),
+        ((10, 7), 1024, 2048, True, 2),
+        ((10, 7), 2048, 2048, True, 1),
+        ((10, 7), 64, 2048, False, 1),
+        ((10, 0), 64, 2048, True, 1),
+    ),
+)
+def test_d128_single_query_forward_split_selector(capability, batch_size, average_seqlen_k, supported, expected):
+    assert _interface._select_q1_fwd_split_kv("auto", capability, batch_size, average_seqlen_k, supported) == expected
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_Q1_SPLIT_TARGET, reason="requires an SM103 or SM107 GPU")
+def test_d128_single_query_auto_forward_split_matches_pytorch():
+    _interface.hstu_varlen_fwd_100.compile_cache.clear()
+    torch.manual_seed(2027)
+    batch, heads, head_dim = 64, 1, 128
+    k_lengths = (1024, 2048, 2560, 3072) * (batch // 4)
+    q = torch.randn((batch, heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    k = torch.randn((sum(k_lengths), heads, head_dim), dtype=torch.bfloat16, device="cuda") * 0.2
+    v = torch.randn_like(k) * 0.2
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    cu_k[1:] = torch.tensor(k_lengths, dtype=torch.int32, device="cuda").cumsum(0)
+    alpha = 0.7
+    scaling_seqlen = 2048.0
+
+    actual = hstu_attention_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_seqlen_q=1,
+        max_seqlen_k=max(k_lengths),
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )["o_tensor"]
+    expected = _reference_forward(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        causal=True,
+    )
+    torch.cuda.synchronize()
+
+    assert next(iter(_interface.hstu_varlen_fwd_100.compile_cache))[-1] == 4
+    torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
 
 
 @pytest.mark.L0

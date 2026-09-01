@@ -13,6 +13,7 @@ import cutlass
 import cutlass.pipeline
 import cutlass.cute as cute
 from cutlass import const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.typing import Int32, Float32, Boolean
 from cutlass.cute.nvgpu import cpasync
@@ -42,8 +43,20 @@ from .block_sparsity import (
 )
 
 
-class HSTUAttentionForwardSm100:
+def _atomic_add_bf16x2(ptr, val_lo: Float32, val_hi: Float32, *, loc=None, ip=None):
+    """Packed BF16x2 atomic add used by the split-KV epilogue."""
+    llvm.inline_asm(
+        None,
+        [ptr, val_hi.ir_value(loc=loc, ip=ip), val_lo.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 packed; cvt.rn.bf16x2.f32 packed, $1, $2; red.global.add.noftz.bf16x2 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
+
+class HSTUAttentionForwardSm100:
     arch = 100
 
     def __init__(
@@ -67,6 +80,7 @@ class HSTUAttentionForwardSm100:
         use_causal_mask_r2p: bool = True,
         use_2cta_instrs: bool = False,
         is_q_len_one: bool = False,
+        q1_split_kv: int = 1,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -77,8 +91,12 @@ class HSTUAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.kBlockM = kBlockM
         self.kBlockN = kBlockN
+        self.q1_split_kv = q1_split_kv
+        assert q1_split_kv in (1, 2, 4)
+        assert q1_split_kv == 1 or is_q_len_one
         self.use_2cta_instrs = (
             use_2cta_instrs
+            and q1_split_kv == 1
             and head_dim == 128
             and head_dim_v == 128
             and is_causal
@@ -152,7 +170,7 @@ class HSTUAttentionForwardSm100:
         self.descriptor_stages = 2
         self.use_clc_descriptor = use_clc_descriptor and self.use_clc_scheduler and not self.use_2cta_instrs
         self.use_precomputed_qk_descriptors = self.q_stage == 2 and not self.use_2cta_instrs
-        self.use_tma_O = use_tma_O and self.use_clc_scheduler
+        self.use_tma_O = use_tma_O and self.use_clc_scheduler and q1_split_kv == 1
         self.use_causal_mask_r2p = use_causal_mask_r2p and self.is_causal and not self.is_local
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
@@ -502,7 +520,7 @@ class HSTUAttentionForwardSm100:
         seqlen_k = max_seqlen_k if const_expr(self.use_clc_scheduler) else cute.size(mK.shape[0])
         tile_sched_args = TileSchedulerArguments(
             num_block,
-            cute.size(mQ.shape[2]),
+            cute.size(mQ.shape[2]) * self.q1_split_kv,
             cute.size(cu_seqlens_q.shape[0] - 1),
             seqlen_k,
             mQ.shape[1],
@@ -1223,6 +1241,21 @@ class HSTUAttentionForwardSm100:
         return SeqlenInfoCls(batch_idx)
 
     @cute.jit
+    def decode_q1_split_head(self, head_idx: Int32):
+        if const_expr(self.q1_split_kv == 1):
+            return head_idx, Int32(0)
+        return head_idx // self.q1_split_kv, head_idx % self.q1_split_kv
+
+    @cute.jit
+    def get_q1_split_n_block_info(self, n_block_max: Int32, n_block_min: Int32, split_idx: Int32):
+        if const_expr(self.q1_split_kv == 1):
+            return n_block_max, n_block_min
+        blocks_per_split = cute.ceil_div(n_block_max - n_block_min, self.q1_split_kv)
+        split_max = max(n_block_min, n_block_max - split_idx * blocks_per_split)
+        split_min = max(n_block_min, split_max - blocks_per_split)
+        return split_max, split_min
+
+    @cute.jit
     def clc_scheduler_warp(self, TileSchedulerCls: Callable):
         tile_scheduler = TileSchedulerCls()
         if const_expr(self.use_clc_descriptor):
@@ -1465,6 +1498,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            head_idx, split_idx = self.decode_q1_split_head(head_idx)
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset = seqlen.offset_q
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
@@ -1551,6 +1585,7 @@ class HSTUAttentionForwardSm100:
                     m_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
             has_work = n_block_max > n_block_min
             if has_work:
                 if const_expr(self.q_stage == 2):
@@ -2468,6 +2503,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            _, split_idx = self.decode_q1_split_head(head_idx)
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
             offset_dynamic = 0 if (offset_dynamic <= self.kBlockM or not self.enable_offset_dynamic) else offset_dynamic
@@ -2479,6 +2515,7 @@ class HSTUAttentionForwardSm100:
                     m_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
             n_block_nums = n_block_max - n_block_min
 
             if n_block_nums > 0:
@@ -2698,6 +2735,7 @@ class HSTUAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            head_idx, split_idx = self.decode_q1_split_head(head_idx)
             q_work_block = m_block
             seqlen = self.get_seqlen_info(work_tile, batch_idx, SeqlenInfoCls)
             offset_dynamic = (self.logical_cta_tiler[0] - (seqlen.seqlen_q & (self.logical_cta_tiler[0] - 1))) & (self.logical_cta_tiler[0] - 1)
@@ -2720,6 +2758,9 @@ class HSTUAttentionForwardSm100:
                     q_work_block,
                 )
                 n_block_min = Int32(0)
+            n_block_max, n_block_min = self.get_q1_split_n_block_info(n_block_max, n_block_min, split_idx)
+            if const_expr(self.q1_split_kv > 1):
+                n_masking_steps = min(n_masking_steps, n_block_max - n_block_min) if split_idx == 0 else Int32(0)
             has_work = n_block_max > n_block_min
             # func: (head_func, n_func, L_func) -> (n_func, L_func)
             func_tensor = func[0, None, None] if func is not None else None
@@ -3126,6 +3167,10 @@ class HSTUAttentionForwardSm100:
 
         cute.arch.barrier(barrier_id=EPILOGUE_BARRIER_BASE + stage, number_of_threads=cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
 
+        if const_expr(self.q1_split_kv > 1):
+            self._atomic_add_q1_split_O(head_idx, stage, seqlen, mO, sO)
+            return
+
         logical_stage_start = m_block * self.kBlockM - offset_dynamic
         valid_rows = min(
             self.kBlockM,
@@ -3192,6 +3237,23 @@ class HSTUAttentionForwardSm100:
                 mO,
                 sO,
             )
+
+    @cute.jit
+    def _atomic_add_q1_split_O(
+        self,
+        head_idx: Int32,
+        stage: int,
+        seqlen: Callable,
+        mO: cute.Tensor,
+        sO: cute.Tensor,
+    ):
+        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.silu1_warp_ids))
+        if tidx < self.head_dim_v_padded // 2 and seqlen.seqlen_q > 0:
+            dim_idx = tidx * 2
+            val_lo = sO[0, dim_idx, stage].to(Float32)
+            val_hi = sO[0, dim_idx + 1, stage].to(Float32)
+            mO_row = mO[seqlen.offset_q, None, head_idx]
+            _atomic_add_bf16x2((mO_row.iterator + dim_idx).llvm_ptr, val_lo, val_hi)
 
     @cute.jit
     def _store_O_to_gmem(

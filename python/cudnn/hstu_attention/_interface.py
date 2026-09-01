@@ -239,6 +239,39 @@ _hstu_varlen_bwd_q1_direct.compile_cache = {}
 _q1_device_capability_cache: dict[torch.device, tuple[int, int]] = {}
 
 
+def _get_q1_device_capability(device: torch.device) -> tuple[int, int]:
+    capability = _q1_device_capability_cache.get(device)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        _q1_device_capability_cache[device] = capability
+    return capability
+
+
+def _select_q1_fwd_split_kv(
+    requested: str,
+    capability: tuple[int, int],
+    batch_size: int,
+    average_seqlen_k: int,
+    supported: bool,
+) -> int:
+    """Resolve the measured qlen=1 split-KV crossover for SM103/SM107."""
+    if requested == "tc-split2":
+        return 2
+    if requested == "tc-split4":
+        return 4
+    if requested != "auto" or not supported or average_seqlen_k < 1536:
+        return 1
+    if capability == (10, 3):
+        if batch_size <= 256:
+            return 4
+        return 2 if batch_size <= 512 else 1
+    if capability == (10, 7):
+        if batch_size <= 128:
+            return 4
+        return 2 if batch_size <= 1024 else 1
+    return 1
+
+
 def _select_q1_bwd_algorithm(
     requested: str,
     batch_size: int,
@@ -248,10 +281,7 @@ def _select_q1_bwd_algorithm(
     if requested != "auto":
         return requested
 
-    capability = _q1_device_capability_cache.get(device)
-    if capability is None:
-        capability = torch.cuda.get_device_capability(device)
-        _q1_device_capability_cache[device] = capability
+    capability = _get_q1_device_capability(device)
 
     # B300 (SM103): the small MMA path wins through BS=384 and the direct
     # path wins from the measured BS=448 point onward.
@@ -288,6 +318,7 @@ def hstu_varlen_fwd_100(
     *,
     out: Optional[torch.Tensor] = None,
     _compile_only: bool = False,
+    _q1_fwd_algorithm: str = "auto",
 ):
     scaling_seqlen = _normalize_scaling_seqlen(scaling_seqlen, max_seqlen_q)
     q_dtype = q.dtype
@@ -312,11 +343,30 @@ def hstu_varlen_fwd_100(
     use_auto_block_metadata = is_arbitrary
     func_num = func.shape[-2] if func is not None else 0
     is_paged = paged_kv is not None
+    q1_split_supported = (
+        is_q_len_one
+        and q_dtype == torch.bfloat16
+        and head_dim == 128
+        and is_causal
+        and not is_local
+        and not is_arbitrary
+        and not is_paged
+        and q.shape[1] == k.shape[1] == v.shape[1]
+    )
+    capability = _get_q1_device_capability(q.device)
+    q1_split_kv = _select_q1_fwd_split_kv(
+        _q1_fwd_algorithm,
+        capability,
+        batch_size,
+        k.shape[0] // max(batch_size, 1),
+        q1_split_supported,
+    )
     # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
     # launch; larger batches have enough query-head CTAs and favor one CTA.
     use_2cta_instrs = (
         (not is_q_len_one or batch_size < 256)
-        and torch.cuda.get_device_capability(q.device) == (10, 7)
+        and q1_split_kv == 1
+        and capability == (10, 7)
         and head_dim == 128
         and is_causal
         and not is_local
@@ -346,6 +396,10 @@ def hstu_varlen_fwd_100(
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
+    if _q1_fwd_algorithm not in ("auto", "tc", "tc-split2", "tc-split4"):
+        raise ValueError(f"Unsupported qlen=1 forward algorithm: {_q1_fwd_algorithm}")
+    if _q1_fwd_algorithm in ("tc-split2", "tc-split4") and not q1_split_supported:
+        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
     compile_key = (
         q.device,
         q_dtype,
@@ -360,6 +414,7 @@ def hstu_varlen_fwd_100(
         use_auto_block_metadata,
         use_2cta_instrs,
         use_clc_descriptor,
+        q1_split_kv,
     )
 
     block_sparse_tensors = None
@@ -421,6 +476,7 @@ def hstu_varlen_fwd_100(
             use_2cta_instrs=use_2cta_instrs,
             use_clc_descriptor=use_clc_descriptor,
             is_q_len_one=is_q_len_one and not use_2cta_instrs,
+            q1_split_kv=q1_split_kv,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
@@ -450,6 +506,8 @@ def hstu_varlen_fwd_100(
         return out, None
 
     with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
+        if q1_split_kv > 1:
+            out.zero_()
         compiled_fwd = hstu_varlen_fwd_100.compile_cache[compile_key]
         compiled_fwd(
             q,

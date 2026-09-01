@@ -142,6 +142,7 @@ def _compile_forward(
     window_size: tuple[int, int],
     alpha: float,
     scaling_seqlen: float,
+    forward_impl: str = "auto",
 ) -> tuple[torch.Tensor, Callable[[], None], float]:
     q = tensors["q"]
     k = tensors["k"]
@@ -154,27 +155,62 @@ def _compile_forward(
     assert isinstance(cu_q, torch.Tensor)
     assert isinstance(cu_k, torch.Tensor)
     out = torch.empty_like(q)
-    api = HSTUFwdSm100(
-        sample_q=q,
-        sample_k=k,
-        sample_v=v,
-        sample_o=out,
-        sample_cu_seqlens_q=cu_q,
-        sample_cu_seqlens_k=cu_k,
-        max_seqlen_q=1,
-        max_seqlen_k=max_k,
-        window_size=window_size,
-        alpha=alpha,
-        scaling_seqlen=scaling_seqlen,
-    )
-    api.check_support()
-    start = time.perf_counter()
-    api.compile()
-    torch.cuda.synchronize()
-    compile_seconds = time.perf_counter() - start
+    if forward_impl == "auto":
+        api = HSTUFwdSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=out,
+            sample_cu_seqlens_q=cu_q,
+            sample_cu_seqlens_k=cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=max_k,
+            window_size=window_size,
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        )
+        api.check_support()
+        start = time.perf_counter()
+        api.compile()
+        torch.cuda.synchronize()
+        compile_seconds = time.perf_counter() - start
 
-    def run() -> None:
-        api.execute(q, k, v, out, cu_q, cu_k)
+        def run() -> None:
+            api.execute(q, k, v, out, cu_q, cu_k)
+
+    else:
+        internal_forward_impl = "auto" if forward_impl == "dispatch" else forward_impl
+        call_args = (
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            1,
+            max_k,
+            window_size[0],
+            window_size[1],
+            alpha,
+            None,
+        )
+        start = time.perf_counter()
+        _interface.hstu_varlen_fwd_100(
+            *call_args,
+            scaling_seqlen=scaling_seqlen,
+            out=out,
+            _compile_only=True,
+            _q1_fwd_algorithm=internal_forward_impl,
+        )
+        torch.cuda.synchronize()
+        compile_seconds = time.perf_counter() - start
+
+        def run() -> None:
+            _interface.hstu_varlen_fwd_100(
+                *call_args,
+                scaling_seqlen=scaling_seqlen,
+                out=out,
+                _q1_fwd_algorithm=internal_forward_impl,
+            )
 
     return out, run, compile_seconds
 
@@ -272,6 +308,7 @@ def _correctness(
     window_size: tuple[int, int],
     alpha: float,
     scaling_seqlen: float,
+    forward_impl: str,
     backward_impl: str,
     direction: str,
 ) -> dict[str, float | bool]:
@@ -301,7 +338,7 @@ def _correctness(
     actual_out = None
     actual_grads = None
     if direction in ("forward", "both"):
-        actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+        actual_out, fwd_run, _ = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen, forward_impl)
         fwd_run()
     if direction in ("backward", "both"):
         actual_grads, bwd_run, _ = _compile_backward(
@@ -348,6 +385,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
+    parser.add_argument("--forward-impl", choices=("auto", "dispatch", "tc", "tc-split2", "tc-split4"), default="auto")
     parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "tc-small", "legacy"), default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
@@ -375,6 +413,7 @@ def main() -> None:
         "average_kv_target": args.average_kv,
         "mask": args.mask,
         "direction": args.direction,
+        "forward_impl": args.forward_impl,
         "backward_impl": args.backward_impl,
     }
 
@@ -387,6 +426,7 @@ def main() -> None:
             window_size,
             alpha,
             scaling_seqlen,
+            args.forward_impl,
             args.backward_impl,
             args.direction,
         )
@@ -409,7 +449,7 @@ def main() -> None:
             "max_kv": max(k_lengths),
         }
         if args.direction in ("forward", "both"):
-            _, run, compile_seconds = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen)
+            _, run, compile_seconds = _compile_forward(tensors, max(k_lengths), window_size, alpha, scaling_seqlen, args.forward_impl)
             case["forward"] = {
                 "compile_seconds": compile_seconds,
                 **_measure_ms(run, args.warmup, args.iterations, args.groups),

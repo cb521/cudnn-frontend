@@ -34,6 +34,38 @@ backward path. The final backward dispatch is reported below.
 | 512 | 0.2285 | 0.2249 | 1.02x | 1.0261 | 0.8069 | 1.27x |
 | 1024 | 0.4557 | 0.4322 | 1.05x | 2.0375 | 1.4264 | 1.43x |
 
+## Split-KV forward
+
+The qlen=1 HSTU output is additive across KV partitions: each partition can
+compute `silu(alpha * QK^T) @ V / scaling_seqlen` independently, without the
+softmax renormalization needed by standard attention. The split path exposes
+2 or 4 virtual heads per real batch/head tile, gives each CTA a contiguous KV
+block range, and atomically combines packed BF16 output pairs. Output zeroing
+is included in every timing below.
+
+The CUDA-core forward experiment was correct but lost decisively to the
+tensor-core kernel. Its B300 times were 0.2728, 0.5855, and 1.0120 ms for
+BS=64/512/1024; Rubin took 0.2525, 0.5355, and 0.9471 ms. The losing kernel is
+not retained.
+
+The final tensor-core comparison uses 10 warmups and the median of seven
+groups of 30 executions:
+
+| GPU | Batch | Unsplit TC (ms) | Selected split (ms) | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| B300 | 64 | 0.0556 | 0.0488 (`split4`) | 1.14x |
+| B300 | 512 | 0.3197 | 0.3154 (`split2`) | 1.01x |
+| B300 | 1024 | 0.6925 | 0.6925 (unsplit) | 1.00x |
+| Rubin | 64 | 0.0440 | 0.0387 (`split4`) | 1.14x |
+| Rubin | 512 | 0.2238 | 0.2170 (`split2`) | 1.03x |
+| Rubin | 1024 | 0.4317 | 0.4224 (`split2`) | 1.02x |
+
+Extra batch-size sweeps set the dispatch boundaries. B300 uses `split4`
+through BS=256, `split2` through BS=512, then unsplit TC. Rubin uses `split4`
+through BS=128, `split2` through BS=1024, then unsplit TC. Split-KV is enabled
+only for the supported causal BF16 D=128 layout when average KV length is at
+least 1536; shorter or unsupported cases preserve the existing path.
+
 ## Small-MMA Q-major backward
 
 The benchmark can force four backward implementations with
@@ -71,7 +103,7 @@ this SM100-family UMMA path. K is loaded once and reinterpreted as the
 transposed dQ operand in shared memory. Four compute warps replace eight for
 the reduced Q tile.
 
-## Automatic dispatch
+## Backward automatic dispatch
 
 The crossover was measured at extra batch sizes rather than inferred from the
 three target points:
@@ -97,9 +129,9 @@ implementation.
 ## Design
 
 The forward kernel uses one Q stage for a one-token query, removing the
-second fully masked 128-row Q tile. Small Rubin launches retain the existing
-two-CTA path because its extra occupancy is faster at batch size 64; larger
-launches and B300 use the one-CTA specialization.
+second fully masked 128-row Q tile. The new split-KV schedule increases CTA
+parallelism only at measured crossover points and fuses the partial-output
+reduction into its epilogue.
 
 Backward chooses among the original tensor-core kernel, the new small-MMA
 Q-major kernel, and `hstu_bwd_q1.py` using the measured architecture-specific
@@ -109,18 +141,6 @@ the existing implementation.
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.
 
-## Split-KV assessment
-
-HSTU's SiLU-weighted output is additive across KV partitions, so forward
-split-KV does not need the softmax renormalization used by standard attention.
-It is technically straightforward, but it adds partial-output storage and a
-reduction launch. At batch sizes 512 and 1024 there are already 2048 and 4096
-independent batch/head CTAs, so the measured kernels have enough parallelism
-without splitting. Batch size 64 is the only target likely to benefit, but its
-measured forward latency is already 0.0569 ms on B300 and 0.0441 ms on Rubin.
-For that reason split-KV is left as a follow-up experiment rather than added
-to the main path.
-
 ## Correctness
 
 The benchmark checks KV lengths `1, 127, 128, 2049, 3072` against a float32
@@ -128,6 +148,8 @@ PyTorch oracle. The oracle runs on CPU so it also works on early Rubin systems
 whose PyTorch device-code toolchain does not yet recognize SM10.7. A separate
 forced-path test checks `tc-small` against `tc` at KV lengths
 `1, 127, 128, 129, 2049`; dQ, dK, and dV are bitwise identical on both B300
-and Rubin. The final automatic dispatch passes the forward and all three
-gradient checks on both architectures, with maximum absolute gradient error
-around `1e-5`.
+and Rubin. Forced `split2` and `split4` forward runs pass the boundary-heavy
+forward oracle on both architectures; the largest observed forward absolute
+error is below `1.6e-5`. The final automatic dispatch passes the forward and
+all three gradient checks on both architectures, with maximum absolute
+gradient error around `1e-5`.
