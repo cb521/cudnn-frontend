@@ -232,8 +232,12 @@ def _correctness(
     alpha: float,
     scaling_seqlen: float,
 ) -> dict[str, float | bool]:
-    tensors = _make_inputs(5, heads, head_dim, 2048, dtype, device, seed=20260901)
-    tensors["k_lengths"] = [1, 127, 128, 2049, 3072]
+    # Keep enough query-head CTAs to exercise Rubin's supported clustered
+    # launch while repeating boundary-heavy KV tails.
+    correctness_batch = 64
+    boundary_lengths = (1, 127, 128, 2049, 3072)
+    tensors = _make_inputs(correctness_batch, heads, head_dim, 2048, dtype, device, seed=20260901)
+    tensors["k_lengths"] = [boundary_lengths[index % len(boundary_lengths)] for index in range(correctness_batch)]
     k_lengths = tensors["k_lengths"]
     assert isinstance(k_lengths, list)
     # Rebuild K/V and metadata for the boundary-heavy correctness lengths.
