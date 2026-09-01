@@ -240,6 +240,9 @@ def _correctness(
     tensors["k_lengths"] = [boundary_lengths[index % len(boundary_lengths)] for index in range(correctness_batch)]
     k_lengths = tensors["k_lengths"]
     assert isinstance(k_lengths, list)
+    # Keep the packed allocation tile-aligned. The individual sequences still
+    # exercise both sides of 128 and long residual tails.
+    k_lengths[-1] += (-sum(k_lengths)) % 128
     # Rebuild K/V and metadata for the boundary-heavy correctness lengths.
     generator = torch.Generator(device=device)
     generator.manual_seed(20260902)
