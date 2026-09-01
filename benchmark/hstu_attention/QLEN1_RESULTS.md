@@ -66,6 +66,36 @@ through BS=128, `split2` through BS=1024, then unsplit TC. Split-KV is enabled
 only for the supported causal BF16 D=128 layout when average KV length is at
 least 1536; shorter or unsupported cases preserve the existing path.
 
+## Forward tile-shape experiment
+
+The smallest useful one-CTA MMA M dimension on these devices is 64, so a
+separate experiment replaced the M128/N128 QK and PV tiles with M64/N128. It
+also tested an N64 KV tile and a qlen=1 epilogue in which only the warp owning
+output row zero participates. M64 needs the native 32-data-path TMEM mapping;
+reusing the M128 software fragment interpretation is numerically incorrect.
+
+All M64 variants pass the boundary oracle on B300 and Rubin. Unsplit M64 is
+bitwise identical to M128 for KV lengths 1, 2, 63, 64, 65, 127, 128, 129, 255,
+256, 257, 2048, 2049, and 3072. The stable interleaved Rubin comparison was:
+
+| Batch | Selected M128 (ms) | Best M64/N128 (ms) | M64 delta | Best M64/N64 (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.0385 (`split4`) | 0.0411 (`split2`) | +6.7% | 0.0434 (`split4`) |
+| 512 | 0.2169 (`split2`) | 0.2221 (`split2`) | +2.4% | 0.2548 (`split4`) |
+| 1024 | 0.4222 (`split2`) | 0.4313 (`split2`) | +2.2% | 0.4978 (`split4`) |
+
+On B300, M128+split4 remains about 4% faster than the best M64 schedule at
+BS=64, and BS=512 slightly favors M128. At BS=1024, forward/reverse
+interleaved runs changed which M tile won as shared-node frequency moved, so
+there is no reproducible M64 speedup. N64 is consistently slower because it
+doubles the roughly 2K-long KV loop and its TMA/barrier overhead even though
+every KV token is useful. Restricting the epilogue to one warp is correct but
+does not materially change latency.
+
+The production dispatch therefore remains M128/N128. The reproducible M64,
+N64, and epilogue variants live on the
+`experiment/hstu-qlen1-fwd-m64` branch and are not selected automatically.
+
 ## Small-MMA Q-major backward
 
 The benchmark can force four backward implementations with
