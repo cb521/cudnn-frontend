@@ -183,7 +183,18 @@ def _hstu_varlen_bwd_q1_direct(
     if dq.shape != q.shape or dk.shape != k.shape or dv.shape != v.shape:
         raise ValueError("HSTU gradient outputs must match their corresponding inputs")
 
-    compile_key = (q.device, q.dtype)
+    batch_size = cu_seqlens_q.shape[0] - 1
+    capability = _get_q1_device_capability(q.device)
+    if capability == (10, 3):
+        # Five 12-warp CTAs fit per B300 SM and win once the grid is large;
+        # 16 warps expose more latency-hiding work for smaller grids.
+        num_threads = 384 if batch_size >= 448 else 512
+    elif capability == (10, 7):
+        num_threads = 512
+    else:
+        num_threads = 256
+
+    compile_key = (q.device, q.dtype, num_threads)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, do, dq, dk, dv)
@@ -191,6 +202,7 @@ def _hstu_varlen_bwd_q1_direct(
         cu_q_tensor, cu_k_tensor = [_mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (cu_seqlens_q, cu_seqlens_k)]
         kernel = HSTUAttentionBackwardQlen1Sm100(
             element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
+            num_threads=num_threads,
         )
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
@@ -205,7 +217,7 @@ def _hstu_varlen_bwd_q1_direct(
                 dv_tensor,
                 cu_q_tensor,
                 cu_k_tensor,
-                Int32(cu_seqlens_q.shape[0] - 1),
+                Int32(batch_size),
                 Int32(q.shape[1]),
                 alpha,
                 scaling_seqlen,
@@ -225,7 +237,7 @@ def _hstu_varlen_bwd_q1_direct(
                 dv,
                 cu_seqlens_q,
                 cu_seqlens_k,
-                Int32(cu_seqlens_q.shape[0] - 1),
+                Int32(batch_size),
                 Int32(q.shape[1]),
                 alpha,
                 scaling_seqlen,
@@ -283,17 +295,21 @@ def _select_q1_bwd_algorithm(
 
     capability = _get_q1_device_capability(device)
 
-    # B300 (SM103): the small MMA path wins through BS=384 and the direct
-    # path wins from the measured BS=448 point onward.
+    # B300 (SM103): direct wins at the requested BS=64 point and from BS=128.
+    # The small-MMA path retains two measured low-grid crossover regions.
     if capability == (10, 3):
-        return "tc-small" if batch_size < 448 else "direct"
+        if batch_size < 64:
+            return "tc-small"
+        if batch_size < 80:
+            return "direct"
+        return "tc-small" if batch_size < 128 else "direct"
 
-    # Rubin (SM107): legacy wins at BS<=64, the small MMA path wins from
-    # BS=128 through BS=832, and direct wins from BS=896 onward.
+    # Rubin (SM107): legacy wins below BS=128, small MMA wins at BS=128,
+    # and the vectorized direct path wins from the measured BS=192 point.
     if capability == (10, 7):
         if batch_size < 128:
             return "legacy"
-        return "tc-small" if batch_size < 896 else "direct"
+        return "tc-small" if batch_size < 192 else "direct"
 
     # Preserve the existing policy on other SM100-family devices.
     return "direct" if batch_size >= 256 else "legacy"

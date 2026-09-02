@@ -138,9 +138,11 @@ the reduced Q tile.
 The crossover was measured at extra batch sizes rather than inferred from the
 three target points:
 
-- B300: `tc-small` through BS=384; `direct` from the measured BS=448 point.
-- Rubin: `legacy` below BS=128, `tc-small` through BS=832, and `direct` from
-  the measured BS=896 point.
+- B300: `tc-small` below BS=64, `direct` through BS=79, `tc-small` through
+  BS=127, and vectorized `direct` from BS=128. The two small-grid regions are
+  retained because CTA-wave boundaries make the crossover non-monotonic.
+- Rubin: `legacy` below BS=128, `tc-small` through BS=191, and vectorized
+  `direct` from BS=192.
 - Other SM100-family devices retain the previous policy.
 
 For the requested batches, the resulting automatic choices and final timings
@@ -148,13 +150,126 @@ are:
 
 | GPU | BS=64 | BS=512 | BS=1024 |
 | --- | ---: | ---: | ---: |
-| B300 | 0.1860 ms (`tc-small`) | 1.0320 ms (`direct`) | 1.8724 ms (`direct`) |
-| Rubin | 0.1313 ms (`legacy`) | 0.7768 ms (`tc-small`) | 1.4907 ms (`direct`) |
+| B300 | 0.1697 ms (`direct`) | 0.9163 ms (`direct`) | 1.7364 ms (`direct`) |
+| Rubin | 0.1272 ms (`legacy`) | 0.6266 ms (`direct`) | 1.1806 ms (`direct`) |
 
-Against the implementation selected by the previous policy, the meaningful
-target-case changes are 12.5% lower latency at B300 BS=64 and 8.7% lower
-latency at Rubin BS=512. The other requested points keep their previous
-implementation.
+Relative to the pre-vectorization dispatch, this final pass lowers B300 by
+7.9%, 2.5%, and 2.5% at BS=64/512/1024. Rubin BS=64 keeps the faster legacy
+path, while BS=512/1024 improve by 13.3% and 12.3%.
+
+## NCU pipeline and work analysis
+
+`profile_hstu_qlen1.py` compiles and warms up outside the CUDA profiler range,
+then exposes exactly one selected execution to Nsight Compute. The B300 runs
+used the command-line `LaunchStats`, occupancy, compute, memory, scheduler,
+warp-state, and instruction metrics.
+
+### Useful work and compulsory traffic
+
+Ignoring the small activation cost, forward performs one QK dot product and
+one weighted-V accumulation per KV row, about `4 * D = 512` FLOPs per
+KV/head. Backward recomputes QK and adds dP, dQ, dK, and dV work, about
+`8 * D = 1024` FLOPs per KV/head. Its compulsory traffic is one K/V read and
+one dK/dV write. The requested workload is therefore approximately one useful
+FLOP per compulsory byte in both directions:
+
+| Batch | Total KV | Forward useful FLOPs / K+V bytes | Backward useful FLOPs / read+write bytes |
+| ---: | ---: | ---: | ---: |
+| 64 | 130,304 | 0.267 GFLOP / 0.267 GB | 0.534 GFLOP / 0.534 GB |
+| 512 | 1,047,808 | 2.146 GFLOP / 2.146 GB | 4.292 GFLOP / 4.292 GB |
+| 1024 | 2,098,944 | 4.299 GFLOP / 4.299 GB | 8.597 GFLOP / 8.597 GB |
+
+The forward M128 tensor-core tile has only one valid Q row, so its hardware
+MMA work is about 128 times the useful Q-row work, plus KV-tail padding. That
+does not make the target workload compute-bound: at BS=1024 NCU reports the
+expected 4.30 GB of K/V reads, 88.3% of peak DRAM throughput, and 40.7% tensor
+pipe activity. The redundant tensor-core work is cheaper than replacing the
+three-stage TMA/MMA pipeline with scalar work.
+
+At BS=64, split4 changes the forward launch from 256 to 1024 CTAs while keeping
+the same 267 MB K/V read volume. In NCU it raises DRAM throughput from 59.6%
+to 69.4%, tensor-core activity from 26.6% to 33.4%, and launch waves from 1.73
+to 6.92; the main kernel falls from 59.3 to 50.9 us. Its included output-zero
+launch costs about 4.2 us. This is why split-KV helps the small batch but does
+little once the unsplit kernel already saturates memory.
+
+### Vectorized direct backward and CTA tuning
+
+The original direct kernel launched 256 threads (8 warps) per batch/head CTA.
+Each warp serially loaded one KV row, reduced QK and dO-V, wrote dK/dV, and
+then advanced by eight rows. NCU identified long-scoreboard stalls as the
+dominant bubble, with no excess DRAM traffic and only 34 registers per thread.
+
+The first optimization widened SM103 and SM107 to 512 threads (16 warps).
+The math, Q-major loop order, and one final dQ write stayed unchanged, while
+twice as many independent KV rows hid more memory latency. The dQ shared
+reduction grew from about 5.1 to 9.2 KB per CTA, which is not the occupancy
+limiter.
+
+| B300 NCU metric | BS64, 8 warps | BS64, 16 warps | BS1024, 8 warps | BS1024, 16 warps |
+| --- | ---: | ---: | ---: | ---: |
+| Kernel duration | 383.8 us | 210.9 us | 1.86 ms | 1.78 ms |
+| DRAM throughput | 16.9% | 30.6% | 59.9% | 62.8% |
+| Active warps | 18.6% | 37.5% | 69.6% | 73.0% |
+| Eligible warps / scheduler cycle | 0.21 | 0.50 | 0.97 | 1.04 |
+| Issue-active | 18.3% | 33.9% | 47.3% | 49.2% |
+
+Instruction profiling then exposed another bottleneck. The scalar kernel
+issued eight coalesced global loads and eight stores per KV/head row. Assigning
+four adjacent BF16 values to each lane allows one 64-bit K load, V load, dK
+store, and dV store. At BS=1024 this reduces executed global-load instructions
+from 67.95 million to 17.38 million and stores from 67.18 million to 16.81
+million. The total executed instruction count falls from 999.34 million to
+863.02 million without changing DRAM bytes or arithmetic.
+
+The vector fragments increase register pressure. A second CTA sweep therefore
+keeps 16 warps for small B300 grids, but uses 12 warps from BS=448 so five CTAs
+can reside per SM. Rubin consistently prefers 16 warps. Final B300 BS=1024 NCU
+reports 44 registers/thread, 7.2 KB shared memory, 64.4% peak DRAM throughput,
+54.8% active warps, 0.74 eligible warps per scheduler cycle, and 43.5%
+issue-active. Although issue occupancy is lower than the scalar 16-warp
+kernel, the 13.6% smaller instruction stream and higher DRAM utilization lower
+kernel time from about 1.78 to 1.73 ms.
+
+At BS=64 the final 16-warp vector kernel keeps active warps essentially flat
+at 37.7%, but raises eligible warps from 0.50 to 0.57, issue-active from 33.9%
+to 35.6%, and DRAM throughput from 30.6% to 37.7%. NCU kernel time falls from
+210.9 to 170.6 us.
+
+The complete direct-path progression is:
+
+| GPU | Batch | 8-warp scalar (ms) | Wider scalar (ms) | Final vector (ms) | Final vs scalar |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B300 | 64 | 0.3851 | 0.2121 | 0.1697 (16 warps) | -55.9% |
+| B300 | 512 | 1.0303 | 0.9396 | 0.9163 (12 warps) | -11.1% |
+| B300 | 1024 | 1.8698 | 1.7810 | 1.7364 (12 warps) | -7.1% |
+| Rubin | 64 | 0.3346 | 0.1847 | 0.1512 (16 warps) | -54.8% |
+| Rubin | 512 | 0.8042 | 0.7227 | 0.6266 (16 warps) | -22.1% |
+| Rubin | 1024 | 1.4247 | 1.3462 | 1.1806 (16 warps) | -17.1% |
+
+Two rejected variants confirm the resource tradeoff. Holding two KV rows per
+warp improved BS=64 by about 4%, but its extra registers slowed BS=512/1024 by
+about 5%. Before vectorization, a 384-thread CTA was slower than 512 threads;
+after vectorization changed the register footprint, retuning made 384 threads
+best for large B300 grids. A 1024-thread CTA reduces CTA residency and remains
+much slower at large batch sizes. Vector loads with scalar stores were also
+rejected: the scalar stores raise final B300 BS=1024 from 1.74 to 2.09 ms.
+
+The early Rubin node runs normal kernels and CUDA-event benchmarks, but both
+Nsight Compute 2025.3.1 and 2026.2.1 fail to initialize its hardware counter
+library (`Failed to initialize LOP`, `LibraryNotLoaded`) with driver 615.12.
+Rubin therefore uses the same kernel-structure diagnosis from B300 plus direct
+before/after timing and correctness measurements on SM107.
+
+### Rejected forward residency experiment
+
+The qlen=1 Q and output shared-memory lifetimes can be made disjoint. Reusing
+that storage and reducing the KV pipeline from three stages to two lowers the
+CTA allocation from about 166 KB to 96 KB and permits two resident CTAs per
+SM. It remains numerically correct, but the shallower pipeline slows B300 by
+about 10% at BS=64/512 and 15% at BS=1024. A driver-level asynchronous memset
+also has no measurable advantage over the existing output zeroing. Neither
+experiment is retained.
 
 ## Design
 
@@ -164,9 +279,9 @@ parallelism only at measured crossover points and fuses the partial-output
 reduction into its epilogue.
 
 Backward chooses among the original tensor-core kernel, the new small-MMA
-Q-major kernel, and `hstu_bwd_q1.py` using the measured architecture-specific
-crossovers above. Unsupported layouts and non-causal or arbitrary masks keep
-the existing implementation.
+Q-major kernel, and the vectorized CUDA-core `hstu_bwd_q1.py` using the
+measured architecture-specific crossovers above. Unsupported layouts and
+non-causal or arbitrary masks keep the existing implementation.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.

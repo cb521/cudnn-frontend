@@ -19,18 +19,20 @@ from .utils import tanhf
 class HSTUAttentionBackwardQlen1Sm100:
     """Q-major CUDA-core kernel for HSTU qlen=1 and D=128.
 
-    One CTA owns a batch/head pair.  Its eight warps traverse disjoint KV
-    rows, write dK/dV without atomics, and retain their dQ partials in
-    registers until a single CTA reduction at the end.
+    One CTA owns a batch/head pair. Its warps traverse disjoint KV rows,
+    use contiguous 64-bit per-lane K/V and dK/dV transfers, write dK/dV
+    without atomics, and retain their dQ partials in registers until a
+    single CTA reduction at the end.
     """
 
-    num_threads = 256
-    num_warps = num_threads // cute.arch.WARP_SIZE
     values_per_lane = 128 // cute.arch.WARP_SIZE
     head_dim = 128
 
-    def __init__(self, element_dtype: Type[cutlass.Numeric]):
+    def __init__(self, element_dtype: Type[cutlass.Numeric], num_threads: int = 256):
+        assert 0 < num_threads <= 1024 and num_threads % cute.arch.WARP_SIZE == 0
         self.element_dtype = element_dtype
+        self.num_threads = num_threads
+        self.num_warps = num_threads // cute.arch.WARP_SIZE
         self.smem_bytes = self.num_warps * self.head_dim * Float32.width // 8
 
     @cute.kernel
@@ -63,7 +65,7 @@ class HSTUAttentionBackwardQlen1Sm100:
         rdO = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
         rdQ = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
         for value_idx in cutlass.range_constexpr(self.values_per_lane):
-            dim_idx = lane_idx + value_idx * cute.arch.WARP_SIZE
+            dim_idx = lane_idx * self.values_per_lane + value_idx
             if has_query:
                 rQ[value_idx] = Q[q_begin, head_idx, dim_idx].to(Float32)
                 rdO[value_idx] = dO[q_begin, head_idx, dim_idx].to(Float32)
@@ -74,20 +76,46 @@ class HSTUAttentionBackwardQlen1Sm100:
 
         inv_scaling = cute.arch.rcp_approx(scaling_seqlen)
         grad_scale = alpha * inv_scaling
+        vector_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.element_dtype,
+            num_bits_per_copy=self.values_per_lane * self.element_dtype.width,
+        )
+        vector_copy = cute.make_tiled_copy_tv(
+            vector_copy_atom,
+            cute.make_layout((1, cute.arch.WARP_SIZE)),
+            cute.make_layout((1, self.values_per_lane)),
+        )
+        thread_copy = vector_copy.get_slice(lane_idx)
+        row_layout = cute.make_layout((1, self.head_dim), stride=(0, 1))
         k_idx = k_begin + warp_idx
         while k_idx < k_end:
-            rK = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
-            rV = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), Float32)
+            row_offset_k = cute.assume(
+                k_idx * K.stride[0] + head_idx * K.stride[1],
+                divby=128 // self.element_dtype.width,
+            )
+            row_offset_v = cute.assume(
+                k_idx * V.stride[0] + head_idx * V.stride[1],
+                divby=128 // self.element_dtype.width,
+            )
+            gK = cute.make_tensor(K.iterator + row_offset_k, row_layout)
+            gV = cute.make_tensor(V.iterator + row_offset_v, row_layout)
+            tKgK = thread_copy.partition_S(gK)
+            tVgV = thread_copy.partition_S(gV)
+            tKrK = cute.make_fragment_like(tKgK)
+            tVrV = cute.make_fragment_like(tVgV)
+            cute.copy(vector_copy_atom, tKgK, tKrK)
+            cute.copy(vector_copy_atom, tVgV, tVrV)
+            rK = tKrK.load().to(Float32)
             qk = Float32(0.0)
+            for value_idx in cutlass.range_constexpr(self.values_per_lane):
+                qk += rQ[value_idx] * rK[value_idx]
+            qk = cute.arch.warp_reduction(qk, operator.add)
+
+            rV = tVrV.load().to(Float32)
             dov = Float32(0.0)
             for value_idx in cutlass.range_constexpr(self.values_per_lane):
-                dim_idx = lane_idx + value_idx * cute.arch.WARP_SIZE
-                rK[value_idx] = K[k_idx, head_idx, dim_idx].to(Float32)
-                rV[value_idx] = V[k_idx, head_idx, dim_idx].to(Float32)
-                qk += rQ[value_idx] * rK[value_idx]
                 dov += rdO[value_idx] * rV[value_idx]
-
-            qk = cute.arch.warp_reduction(qk, operator.add)
             dov = cute.arch.warp_reduction(dov, operator.add)
             score = alpha * qk
             score_tanh = tanhf(score * Float32(0.5))
@@ -96,11 +124,32 @@ class HSTUAttentionBackwardQlen1Sm100:
             dsilu = sigmoid + weight * (Float32(1.0) - sigmoid)
             ds = dov * dsilu
 
+            rdK = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), dK.element_type)
             for value_idx in cutlass.range_constexpr(self.values_per_lane):
-                dim_idx = lane_idx + value_idx * cute.arch.WARP_SIZE
-                dK[k_idx, head_idx, dim_idx] = dK.element_type(ds * grad_scale * rQ[value_idx])
-                dV[k_idx, head_idx, dim_idx] = dV.element_type(weight * inv_scaling * rdO[value_idx])
+                rdK[value_idx] = dK.element_type(ds * grad_scale * rQ[value_idx])
                 rdQ[value_idx] += ds * rK[value_idx]
+            row_offset_dk = cute.assume(
+                k_idx * dK.stride[0] + head_idx * dK.stride[1],
+                divby=128 // self.element_dtype.width,
+            )
+            gdK = cute.make_tensor(dK.iterator + row_offset_dk, row_layout)
+            tDgdK = thread_copy.partition_D(gdK)
+            tDrdK = cute.make_fragment_like(tDgdK)
+            tDrdK.store(rdK.load())
+            cute.copy(vector_copy_atom, tDrdK, tDgdK)
+
+            rdV = cute.make_rmem_tensor(cute.make_layout((self.values_per_lane,)), dV.element_type)
+            for value_idx in cutlass.range_constexpr(self.values_per_lane):
+                rdV[value_idx] = dV.element_type(weight * inv_scaling * rdO[value_idx])
+            row_offset_dv = cute.assume(
+                k_idx * dV.stride[0] + head_idx * dV.stride[1],
+                divby=128 // self.element_dtype.width,
+            )
+            gdV = cute.make_tensor(dV.iterator + row_offset_dv, row_layout)
+            tDgdV = thread_copy.partition_D(gdV)
+            tDrdV = cute.make_fragment_like(tDgdV)
+            tDrdV.store(rdV.load())
+            cute.copy(vector_copy_atom, tDrdV, tDgdV)
             k_idx += self.num_warps
 
         smem = utils.SmemAllocator()
@@ -110,7 +159,7 @@ class HSTUAttentionBackwardQlen1Sm100:
             byte_alignment=16,
         )
         for value_idx in cutlass.range_constexpr(self.values_per_lane):
-            dim_idx = lane_idx + value_idx * cute.arch.WARP_SIZE
+            dim_idx = lane_idx * self.values_per_lane + value_idx
             sdQ[dim_idx, warp_idx] = rdQ[value_idx]
         cute.arch.barrier()
 
