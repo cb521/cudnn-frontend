@@ -155,11 +155,70 @@ the more heavily utilized pipeline. Kernel duration increases by 4.6%, 2.6%, and
 BS=64/512/1024. At BS=1024 the M64 fragment/TMEM path also raises total
 executed instructions from 118.66 M to 178.72 M.
 
-The precise conclusion is therefore stronger than a FLOP count but narrower
-than saying that all MMA latency is free: K/V movement is on the critical
-path, and halving nominal MMA work does not halve MMA issue cost or tensor
-active cycles. The saved operations cannot shorten the memory-dominated tile
-pipeline, while the M64 software mapping adds instruction overhead.
+This M64 experiment alone cannot establish that doing less MMA work is
+intrinsically slower, and aggregate utilization counters cannot prove temporal
+TMA/MMA overlap. M64 changes the instruction shape and software mapping at the
+same time: it halves nominal operations, leaves the UTCMMA instruction count
+unchanged, and adds scalar instructions. It therefore establishes only that
+this particular M64 implementation loses.
+
+### Controlled MMA-work and KV-pipeline check
+
+A stricter B300 experiment kept the M128/N128 tile, TMA loads, KV bytes, grid,
+and output unchanged, but reissued each QK MMA 2, 4, or 8 times with zero-init
+to the same TMEM destination. Every variant produced exactly the same output.
+Because PV is unchanged, these variants execute 1.5x, 2.5x, and 4.5x the
+baseline tensor work. CUDA-event medians below use 20 warmups and 11 groups of
+80 executions.
+
+| Batch | Baseline (ms) | QK 2x (ms) | QK 4x (ms) | QK 8x (ms) |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.05494 | 0.05842 (+6.3%) | 0.07418 (+35.0%) | 0.12501 (+127.5%) |
+| 512 | 0.34364 | 0.39536 (+15.1%) | 0.56371 (+64.0%) | 0.86811 (+152.6%) |
+| 1024 | 0.69955 | 0.81857 (+17.0%) | 1.12344 (+60.6%) | 1.75064 (+150.3%) |
+
+NCU at BS=1024 confirms that this is the intended controlled variable:
+
+| Variant | Duration | DRAM read | BF16 tensor ops | UTCMMA instructions |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 698.18 us | 4.30 GB | 550.23 G | 1.049 M |
+| QK 2x | 763.55 us | 4.30 GB | 825.34 G | 1.574 M |
+| QK 4x | 1.14 ms | 4.30 GB | 1375.56 G | 2.624 M |
+| QK 8x | 2.02 ms | 4.30 GB | 2476.02 G | 4.723 M |
+
+The immediate 6--17% slowdown from QK 2x proves that MMA is already on the
+critical path; it is not completely hidden by data movement. The slowdown is
+far below the 50% increase in total tensor work, so the pipeline still has
+overlap or utilization headroom, but this experiment alone does not identify
+TMA as the source of that headroom.
+
+To test the KV pipeline directly, another diagnostic forced its shared-memory
+ring from three stages to two or one. With one slot, the TMA producer cannot
+issue the next K or V transfer until the UTCMMA consumer releases the current
+slot. This removes the producer's lookahead while preserving the output,
+tensor work, KV bytes, grid, and register count.
+
+| Batch | Three KV stages (ms) | Two KV stages (ms) | One KV stage (ms) | One-stage slowdown |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.05494 | 0.06648 | 0.11419 | 2.08x |
+| 512 | 0.34364 | 0.38043 | 0.57506 | 1.67x |
+| 1024 | 0.69955 | 0.77335 | 1.11120 | 1.59x |
+
+At BS=1024, NCU reports the same 4.30 GB DRAM reads, 550.23 G tensor ops,
+1.049 M UTCMMA instructions, 168 registers per thread, 27.68 launch waves,
+and one resident CTA for both schedules. The one-stage version lowers dynamic
+shared memory rather than occupancy. NCU duration changes monotonically from
+698.18 us to 881.47 us and 1.59 ms for three, two, and one stage; measured DRAM
+throughput falls from 80.36% to 63.65% and 35.26%. Thus the multistage
+TMA/UTCMMA producer-consumer pipeline has a material benefit. This comparison
+includes both temporal overlap and the extra outstanding-TMA depth; it does
+not assign an exact cycle count to TMA-over-MMA overlap. A literal overlap
+percentage would require an in-kernel timestamp trace.
+
+The combined conclusion is that TMA/MMA pipelining matters, but MMA is only
+partially hidden. The M64 path loses because it fails to reduce issued MMA
+instructions and adds mapping overhead, not because reducing arithmetic can
+never help.
 
 The production dispatch therefore remains M128/N128. The reproducible M64,
 N64, and epilogue variants live on the
