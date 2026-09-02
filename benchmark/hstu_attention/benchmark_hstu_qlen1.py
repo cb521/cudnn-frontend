@@ -263,6 +263,7 @@ def _compile_backward(
             api.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k)
 
     else:
+        internal_backward_impl = "auto" if backward_impl == "dispatch" else backward_impl
         call_args = (
             do,
             q,
@@ -286,7 +287,7 @@ def _compile_backward(
         _interface.hstu_varlen_bwd_100(
             *call_args,
             _compile_only=True,
-            _q1_bwd_algorithm=backward_impl,
+            _q1_bwd_algorithm=internal_backward_impl,
         )
         torch.cuda.synchronize()
         compile_seconds = time.perf_counter() - start
@@ -294,7 +295,7 @@ def _compile_backward(
         def run() -> None:
             _interface.hstu_varlen_bwd_100(
                 *call_args,
-                _q1_bwd_algorithm=backward_impl,
+                _q1_bwd_algorithm=internal_backward_impl,
             )
 
     return (dq, dk, dv), run, compile_seconds
@@ -385,8 +386,29 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
-    parser.add_argument("--forward-impl", choices=("auto", "dispatch", "tc", "tc-split2", "tc-split4"), default="auto")
-    parser.add_argument("--backward-impl", choices=("auto", "direct", "tc", "tc-small", "legacy"), default="auto")
+    parser.add_argument(
+        "--forward-impl",
+        choices=("auto", "dispatch", "tc", "tc-split2", "tc-split4"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--backward-impl",
+        choices=(
+            "auto",
+            "dispatch",
+            "direct",
+            "direct-split2",
+            "direct-split4",
+            "direct-split8",
+            "direct-split16",
+            "direct-split32",
+            "direct-split64",
+            "tc",
+            "tc-small",
+            "legacy",
+        ),
+        default="auto",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--groups", type=int, default=7)
@@ -455,8 +477,19 @@ def main() -> None:
                 **_measure_ms(run, args.warmup, args.iterations, args.groups),
             }
         if args.direction in ("backward", "both"):
-            if args.backward_impl == "auto":
-                case["selected_backward_impl"] = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
+            if args.backward_impl in ("auto", "dispatch"):
+                selected_backward_impl = _interface._select_q1_bwd_algorithm("auto", batch_size, device)
+                split_kv = _interface._select_q1_bwd_split_kv(
+                    "auto",
+                    torch.cuda.get_device_capability(device),
+                    batch_size,
+                    args.heads,
+                    sum(k_lengths) // batch_size,
+                    dtype == torch.bfloat16 and args.head_dim == 128 and args.mask == "causal",
+                )
+                if split_kv > 1:
+                    selected_backward_impl = f"direct-split{split_kv}"
+                case["selected_backward_impl"] = selected_backward_impl
             _, run, compile_seconds = _compile_backward(
                 tensors,
                 max(k_lengths),

@@ -168,6 +168,7 @@ def _hstu_varlen_bwd_q1_direct(
     cu_seqlens_k: torch.Tensor,
     alpha: float,
     scaling_seqlen: float,
+    split_kv: int,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
@@ -193,8 +194,12 @@ def _hstu_varlen_bwd_q1_direct(
         num_threads = 512
     else:
         num_threads = 256
+    if split_kv > 1:
+        # Shrink each split CTA, but keep at least four warps so the per-CTA
+        # dQ reduction and short KV loop still have enough parallel work.
+        num_threads = max(128, (num_threads // split_kv // 32) * 32)
 
-    compile_key = (q.device, q.dtype, num_threads)
+    compile_key = (q.device, q.dtype, num_threads, split_kv)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, do, dq, dk, dv)
@@ -203,6 +208,7 @@ def _hstu_varlen_bwd_q1_direct(
         kernel = HSTUAttentionBackwardQlen1Sm100(
             element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
             num_threads=num_threads,
+            split_kv=split_kv,
         )
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
@@ -227,6 +233,8 @@ def _hstu_varlen_bwd_q1_direct(
 
     if not _compile_only:
         with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
+            if split_kv > 1:
+                dq.zero_()
             _hstu_varlen_bwd_q1_direct.compile_cache[compile_key](
                 q,
                 k,
@@ -313,6 +321,50 @@ def _select_q1_bwd_algorithm(
 
     # Preserve the existing policy on other SM100-family devices.
     return "direct" if batch_size >= 256 else "legacy"
+
+
+_Q1_BWD_DIRECT_SPLITS = {
+    "direct": 1,
+    "direct-split2": 2,
+    "direct-split4": 4,
+    "direct-split8": 8,
+    "direct-split16": 16,
+    "direct-split32": 32,
+    "direct-split64": 64,
+}
+
+
+def _select_q1_bwd_split_kv(
+    requested: str,
+    capability: tuple[int, int],
+    batch_size: int,
+    num_heads: int,
+    average_seqlen_k: int,
+    supported: bool,
+) -> int:
+    """Resolve the measured direct-backward split-KV schedule."""
+    if requested in _Q1_BWD_DIRECT_SPLITS:
+        return _Q1_BWD_DIRECT_SPLITS[requested]
+    if requested != "auto" or not supported or average_seqlen_k < 1536:
+        return 1
+
+    # At the target average KV length, B300 benefits until the requested grid
+    # reaches roughly 32K short CTAs. Rubin reaches its crossover one step
+    # earlier. Keep at least 32 average KV rows per CTA so fixed CTA and dQ
+    # reduction costs do not dominate.
+    base_ctas = max(batch_size * num_heads, 1)
+    desired_split = 32768 // base_ctas
+    if capability == (10, 3):
+        minimum_useful_split = 8
+    elif capability == (10, 7):
+        minimum_useful_split = 16
+    else:
+        return 1
+    if desired_split < minimum_useful_split:
+        return 1
+    max_split_for_work = max((average_seqlen_k + 31) // 32, 1)
+    split_kv = min(desired_split, max_split_for_work, 64)
+    return 1 << (split_kv.bit_length() - 1)
 
 
 def hstu_varlen_fwd_100(
@@ -610,13 +662,27 @@ def hstu_varlen_bwd_100(
     q1_outputs_direct = (dq is None and dk is None and dv is None) or (
         dq is not None and dk is not None and dv is not None and all(_supports_bwd_direct_grad_layout(tensor) for tensor in (dq, dk, dv))
     )
-    if _q1_bwd_algorithm not in ("auto", "direct", "tc", "tc-small", "legacy"):
+    q1_bwd_algorithms = ("auto", *_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small", "legacy")
+    if _q1_bwd_algorithm not in q1_bwd_algorithms:
         raise ValueError(f"Unsupported qlen=1 backward algorithm: {_q1_bwd_algorithm}")
     q1_direct_supported = is_q_len_one_d128 and is_causal and not is_arbitrary and q1_inputs_direct and q1_outputs_direct
-    if _q1_bwd_algorithm in ("direct", "tc", "tc-small") and not q1_direct_supported:
+    if _q1_bwd_algorithm in (*_Q1_BWD_DIRECT_SPLITS, "tc", "tc-small") and not q1_direct_supported:
         raise ValueError(f"The {_q1_bwd_algorithm} qlen=1 backward algorithm requires causal D=128 qlen=1 with direct layouts")
+    if _Q1_BWD_DIRECT_SPLITS.get(_q1_bwd_algorithm, 1) > 1 and q_dtype != torch.bfloat16:
+        raise ValueError("The split-KV qlen=1 backward algorithms currently require BF16")
+    capability = _get_q1_device_capability(q.device)
+    q1_bwd_split_kv = _select_q1_bwd_split_kv(
+        _q1_bwd_algorithm,
+        capability,
+        batch_size,
+        num_heads,
+        k.shape[0] // max(batch_size, 1),
+        q1_direct_supported and q_dtype == torch.bfloat16,
+    )
     selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device) if q1_direct_supported else _q1_bwd_algorithm
-    use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm == "direct"
+    if _q1_bwd_algorithm == "auto" and q1_bwd_split_kv > 1:
+        selected_q1_bwd_algorithm = "direct"
+    use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS
     use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
     use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"
     if use_q1_direct_kernel:
@@ -629,6 +695,7 @@ def hstu_varlen_bwd_100(
             cu_seqlens_k,
             alpha,
             scaling_seqlen,
+            q1_bwd_split_kv,
             dq,
             dk,
             dv,

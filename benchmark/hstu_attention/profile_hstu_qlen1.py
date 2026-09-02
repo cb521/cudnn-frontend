@@ -33,7 +33,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--backward-impl",
-        choices=("direct", "tc", "tc-small", "legacy"),
+        choices=(
+            "dispatch",
+            "direct",
+            "direct-split2",
+            "direct-split4",
+            "direct-split8",
+            "direct-split16",
+            "direct-split32",
+            "direct-split64",
+            "tc",
+            "tc-small",
+            "legacy",
+        ),
         default="direct",
     )
     parser.add_argument("--warmup", type=int, default=3)

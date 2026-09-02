@@ -98,11 +98,12 @@ N64, and epilogue variants live on the
 
 ## Small-MMA Q-major backward
 
-The benchmark can force four backward implementations with
-`--backward-impl legacy|tc|tc-small|direct`. `legacy` is the original
-tensor-core schedule, `tc` is the first Q-major experiment, `tc-small` is the
-new small-MMA path, and `direct` is the specialized CUDA-core path. The tables
-below use 10 warmups and the median of five groups of 30 executions.
+The benchmark can force the four base backward implementations with
+`--backward-impl legacy|tc|tc-small|direct`; later sections also use the
+`direct-split*` variants. `legacy` is the original tensor-core schedule, `tc`
+is the first Q-major experiment, `tc-small` is the new small-MMA path, and
+`direct` is the specialized CUDA-core path. The tables below use 10 warmups
+and the median of five groups of 30 executions.
 
 ### B300 (SM10.3)
 
@@ -133,10 +134,10 @@ this SM100-family UMMA path. K is loaded once and reinterpreted as the
 transposed dQ operand in shared memory. Four compute warps replace eight for
 the reduced Q tile.
 
-## Backward automatic dispatch
+## Pre-split backward automatic dispatch
 
-The crossover was measured at extra batch sizes rather than inferred from the
-three target points:
+Before adding backward split-KV, the crossover was measured at extra batch
+sizes rather than inferred from the three target points:
 
 - B300: `tc-small` below BS=64, `direct` through BS=79, `tc-small` through
   BS=127, and vectorized `direct` from BS=128. The two small-grid regions are
@@ -145,8 +146,7 @@ three target points:
   `direct` from BS=192.
 - Other SM100-family devices retain the previous policy.
 
-For the requested batches, the resulting automatic choices and final timings
-are:
+For the requested batches, those pre-split automatic choices and timings were:
 
 | GPU | BS=64 | BS=512 | BS=1024 |
 | --- | ---: | ---: | ---: |
@@ -185,6 +185,31 @@ does not make the target workload compute-bound: at BS=1024 NCU reports the
 expected 4.30 GB of K/V reads, 88.3% of peak DRAM throughput, and 40.7% tensor
 pipe activity. The redundant tensor-core work is cheaper than replacing the
 three-stage TMA/MMA pipeline with scalar work.
+
+### Why the CUDA-core forward loses
+
+A second B300 experiment kept the direct kernel's scalar K/V row loads and
+loop structure but removed QK, SiLU, and the weighted-V accumulation. The
+loaded values were accumulated into a live result so the compiler could not
+delete the traffic. With 10 warmups and five groups of 30 executions, full
+direct, load-only, and tensor-core timings were:
+
+| Batch | Direct full (ms) | Direct load-only (ms) | Tensor core (ms) |
+| ---: | ---: | ---: | ---: |
+| 64 | 0.2734 | 0.2174 | 0.0566 |
+| 512 | 0.5864 | 0.5671 | 0.3201 |
+| 1024 | 1.0123 | 0.9875 | 0.6616 |
+
+At BS=1024, deleting nearly all arithmetic saves only 0.025 ms, while the
+load-only path remains 1.49x slower than the tensor-core path. NCU confirms
+that this is a copy/pipeline problem rather than useful CUDA-core math. All
+three kernels read about 4.30 GB from DRAM, but load-only reaches 57.2% of
+peak DRAM bandwidth versus 87.8% for the TMA/tensor-core kernel. It executes
+67.30 million scalar global-load instructions and 348.80 million total
+instructions; the TMA path reports 0.246 million global-load instructions
+and 118.73 million total instructions. Long-scoreboard stall ratio is 26.2
+for load-only versus 13.0 for TMA. The diagnostic direct kernels were removed
+after profiling; production keeps the TMA/tensor-core implementation.
 
 At BS=64, split4 changes the forward launch from 256 to 1024 CTAs while keeping
 the same 267 MB K/V read volume. In NCU it raises DRAM throughput from 59.6%
@@ -255,6 +280,48 @@ best for large B300 grids. A 1024-thread CTA reduces CTA residency and remains
 much slower at large batch sizes. Vector loads with scalar stores were also
 rejected: the scalar stores raise final B300 BS=1024 from 1.74 to 2.09 ms.
 
+### Split-KV direct backward
+
+The direct qlen=1 backward is also additive over KV partitions for dQ. Each
+split CTA owns a contiguous KV range, writes its disjoint dK/dV rows normally,
+and reduces its local dQ contribution in shared memory. Only the final 128
+dQ values need cross-CTA combination; 64 threads issue packed BF16x2 atomic
+adds after a small dQ zero-fill. There are no dK/dV atomics and no partial
+gradient workspace.
+
+The split count and CTA size were swept in the same allocation. Splitting by
+2 or 4 is too little for the small grid, while excessive splitting repeats
+Q/dO loads, metadata, CTA setup, local dQ reduction, and atomics. The measured
+choices target roughly 32K short CTAs, cap the split at 64, and retain at least
+about 32 average KV rows per CTA. B300 accepts split8 as its last useful
+crossover; Rubin requires at least split16 because its unsplit direct kernel
+is already faster at large grids.
+
+The final automatic choices and same-allocation comparisons use 10 warmups
+and the median of five groups of 30 executions:
+
+| GPU | Batch | Previous dispatch (ms) | Split selection | Final (ms) | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B300 | 64 | 0.1727 (`direct`) | 64 | 0.1178 | 1.47x |
+| B300 | 512 | 0.9204 (`direct`) | 16 | 0.8444 | 1.09x |
+| B300 | 1024 | 1.7438 (`direct`) | 8 | 1.6658 | 1.05x |
+| Rubin | 64 | 0.1310 (`legacy`) | 64 | 0.0904 | 1.45x |
+| Rubin | 512 | 0.6653 (`direct`) | 16 | 0.6457 | 1.03x |
+| Rubin | 1024 | 1.2435 (`direct`) | 1 | 1.2435 | 1.00x |
+
+The B300 BS=64 NCU comparison makes the tradeoff explicit. The main kernel
+falls from 177.7 to 114.2 us; the included dQ zero-fill is 10.3 us. Total
+K/V and gradient DRAM traffic stays near 492 MB, while active warps rise from
+37.6% to 58.7%, eligible warps per scheduler cycle from 0.50 to 0.85, issue
+activity from 34.1% to 47.1%, and DRAM throughput from 36.1% to 56.1%.
+Executed instructions increase from 51.63 to 60.58 million, so the speedup
+comes from latency hiding and higher memory utilization despite extra work.
+
+Forced split8, split16, and split64 pass the boundary-length CPU oracle on
+B300 and Rubin. dK/dV maximum absolute errors remain below 1e-6. Packed BF16
+dQ atomics introduce order-dependent rounding; observed dQ maximum absolute
+error is 2e-5 to 6e-5. Deterministic HSTU backward was already unsupported.
+
 The early Rubin node runs normal kernels and CUDA-event benchmarks, but both
 Nsight Compute 2025.3.1 and 2026.2.1 fail to initialize its hardware counter
 library (`Failed to initialize LOP`, `LibraryNotLoaded`) with driver 615.12.
@@ -280,8 +347,11 @@ reduction into its epilogue.
 
 Backward chooses among the original tensor-core kernel, the new small-MMA
 Q-major kernel, and the vectorized CUDA-core `hstu_bwd_q1.py` using the
-measured architecture-specific crossovers above. Unsupported layouts and
-non-causal or arbitrary masks keep the existing implementation.
+measured architecture-specific crossovers above. For long BF16 KV sequences,
+the direct kernel additionally splits the KV range across independently
+scheduled CTAs and atomically combines only dQ. Unsupported layouts,
+non-causal or arbitrary masks, FP16, and short-KV cases keep the existing
+implementation.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.
@@ -295,6 +365,6 @@ forced-path test checks `tc-small` against `tc` at KV lengths
 `1, 127, 128, 129, 2049`; dQ, dK, and dV are bitwise identical on both B300
 and Rubin. Forced `split2` and `split4` forward runs pass the boundary-heavy
 forward oracle on both architectures; the largest observed forward absolute
-error is below `1.6e-5`. The final automatic dispatch passes the forward and
-all three gradient checks on both architectures, with maximum absolute
-gradient error around `1e-5`.
+error is below `1.6e-5`. Forced backward split8, split16, and split64 runs
+also pass on both architectures; dQ reaches `6.2e-5` maximum absolute error
+from BF16 atomic accumulation, while dK/dV remain below `1e-6`.

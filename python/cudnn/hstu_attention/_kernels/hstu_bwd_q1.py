@@ -12,27 +12,43 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
 
 from .utils import tanhf
+
+
+def _atomic_add_bf16x2(ptr, val_lo: Float32, val_hi: Float32, *, loc=None, ip=None):
+    """Packed BF16x2 atomic add used to combine split-KV dQ partials."""
+    llvm.inline_asm(
+        None,
+        [ptr, val_hi.ir_value(loc=loc, ip=ip), val_lo.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b32 packed; cvt.rn.bf16x2.f32 packed, $1, $2; red.global.add.noftz.bf16x2 [$0], packed; }",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class HSTUAttentionBackwardQlen1Sm100:
     """Q-major CUDA-core kernel for HSTU qlen=1 and D=128.
 
-    One CTA owns a batch/head pair. Its warps traverse disjoint KV rows,
-    use contiguous 64-bit per-lane K/V and dK/dV transfers, write dK/dV
-    without atomics, and retain their dQ partials in registers until a
-    single CTA reduction at the end.
+    One or more CTAs own a batch/head pair. Their warps traverse disjoint KV
+    rows, use contiguous 64-bit per-lane K/V and dK/dV transfers, and write
+    dK/dV without atomics. The unsplit path writes dQ once after a CTA-local
+    reduction; split-KV paths atomically combine one dQ partial per CTA.
     """
 
     values_per_lane = 128 // cute.arch.WARP_SIZE
     head_dim = 128
 
-    def __init__(self, element_dtype: Type[cutlass.Numeric], num_threads: int = 256):
+    def __init__(self, element_dtype: Type[cutlass.Numeric], num_threads: int = 256, split_kv: int = 1):
         assert 0 < num_threads <= 1024 and num_threads % cute.arch.WARP_SIZE == 0
+        assert split_kv in (1, 2, 4, 8, 16, 32, 64)
         self.element_dtype = element_dtype
         self.num_threads = num_threads
         self.num_warps = num_threads // cute.arch.WARP_SIZE
+        self.split_kv = split_kv
         self.smem_bytes = self.num_warps * self.head_dim * Float32.width // 8
 
     @cute.kernel
@@ -51,7 +67,7 @@ class HSTUAttentionBackwardQlen1Sm100:
         scaling_seqlen: Float32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        batch_idx, head_idx, _ = cute.arch.block_idx()
+        batch_idx, head_idx, split_idx = cute.arch.block_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.warp_idx()
 
@@ -88,8 +104,11 @@ class HSTUAttentionBackwardQlen1Sm100:
         )
         thread_copy = vector_copy.get_slice(lane_idx)
         row_layout = cute.make_layout((1, self.head_dim), stride=(0, 1))
-        k_idx = k_begin + warp_idx
-        while k_idx < k_end:
+        rows_per_split = (k_end - k_begin + self.split_kv - 1) // self.split_kv
+        split_begin = min(k_end, k_begin + split_idx * rows_per_split)
+        split_end = min(k_end, split_begin + rows_per_split)
+        k_idx = split_begin + warp_idx
+        while k_idx < split_end:
             row_offset_k = cute.assume(
                 k_idx * K.stride[0] + head_idx * K.stride[1],
                 divby=128 // self.element_dtype.width,
@@ -163,11 +182,28 @@ class HSTUAttentionBackwardQlen1Sm100:
             sdQ[dim_idx, warp_idx] = rdQ[value_idx]
         cute.arch.barrier()
 
-        if tidx < self.head_dim and has_query:
-            dq_sum = Float32(0.0)
+        if cutlass.const_expr(self.split_kv == 1):
+            if tidx < self.head_dim and has_query:
+                dq_sum = Float32(0.0)
+                for reduce_warp in cutlass.range_constexpr(self.num_warps):
+                    dq_sum += sdQ[tidx, reduce_warp]
+                dQ[q_begin, head_idx, tidx] = dQ.element_type(dq_sum * grad_scale)
+        elif tidx < self.head_dim // 2 and has_query:
+            dim_idx = tidx * 2
+            dq_lo = Float32(0.0)
+            dq_hi = Float32(0.0)
             for reduce_warp in cutlass.range_constexpr(self.num_warps):
-                dq_sum += sdQ[tidx, reduce_warp]
-            dQ[q_begin, head_idx, tidx] = dQ.element_type(dq_sum * grad_scale)
+                dq_lo += sdQ[dim_idx, reduce_warp]
+                dq_hi += sdQ[dim_idx + 1, reduce_warp]
+            row_offset_dq = cute.assume(
+                q_begin * dQ.stride[0] + head_idx * dQ.stride[1],
+                divby=128 // self.element_dtype.width,
+            )
+            _atomic_add_bf16x2(
+                (dQ.iterator + row_offset_dq + dim_idx).llvm_ptr,
+                dq_lo * grad_scale,
+                dq_hi * grad_scale,
+            )
 
     @cute.jit
     def __call__(
@@ -200,7 +236,7 @@ class HSTUAttentionBackwardQlen1Sm100:
             alpha,
             scaling_seqlen,
         ).launch(
-            grid=(batch_size, num_heads, 1),
+            grid=(batch_size, num_heads, self.split_kv),
             block=(self.num_threads, 1, 1),
             smem=self.smem_bytes,
             stream=stream,
