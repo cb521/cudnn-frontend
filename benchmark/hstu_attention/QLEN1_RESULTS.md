@@ -130,6 +130,37 @@ doubles the roughly 2K-long KV loop and its TMA/barrier overhead even though
 every KV token is useful. Restricting the epilogue to one warp is correct but
 does not materially change latency.
 
+### M64 critical-path counter check
+
+A follow-up B300 NCU run forced unsplit M128/N128 and M64/N128 on identical
+inputs. This isolates the M dimension while keeping the KV tile, launch grid,
+and input bytes fixed. NCU metric-replay durations are higher than CUDA-event
+timings, so only paired relative values are used here.
+
+| Batch | M tile | Duration (us) | DRAM read | DRAM peak | BF16 tensor ops | UTCMMA instructions | Tensor-pipe active |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 128 | 77.82 | 267.04 MB | 45.59% | 34.16 G | 65.2 K | 35.44% |
+| 64 | 64 | 81.41 | 267.05 MB | 43.38% | 17.08 G | 65.2 K | 33.14% |
+| 512 | 128 | 364.90 | 2.15 GB | 76.85% | 274.68 G | 523.9 K | 58.46% |
+| 512 | 64 | 374.24 | 2.15 GB | 74.91% | 137.34 G | 523.9 K | 56.30% |
+| 1024 | 128 | 696.67 | 4.30 GB | 80.55% | 550.23 G | 1049.5 K | 60.30% |
+| 1024 | 64 | 712.51 | 4.30 GB | 78.76% | 275.11 G | 1049.5 K | 58.75% |
+
+M64 exactly halves the tensor math operations, so the smaller instruction is
+doing what was intended. It does not, however, reduce the number of issued
+UTCMMA instructions. Tensor-pipe activity falls by only 1.6--2.3 percentage
+points; at BS=1024 its activity multiplied by duration is essentially
+unchanged (about 420 us versus 419 us). K/V traffic is unchanged and DRAM is
+the more heavily utilized pipeline. Kernel duration increases by 4.6%, 2.6%, and 2.3% at
+BS=64/512/1024. At BS=1024 the M64 fragment/TMEM path also raises total
+executed instructions from 118.66 M to 178.72 M.
+
+The precise conclusion is therefore stronger than a FLOP count but narrower
+than saying that all MMA latency is free: K/V movement is on the critical
+path, and halving nominal MMA work does not halve MMA issue cost or tensor
+active cycles. The saved operations cannot shorten the memory-dominated tile
+pipeline, while the M64 software mapping adds instruction overhead.
+
 The production dispatch therefore remains M128/N128. The reproducible M64,
 N64, and epilogue variants live on the
 `experiment/hstu-qlen1-fwd-m64` branch and are not selected automatically.
