@@ -1507,7 +1507,7 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
     ("capability", "supported", "expected"),
     (
         ((10, 3), True, 1),
-        ((10, 7), True, 2),
+        ((10, 7), True, 1),
         ((10, 7), False, 1),
         ((10, 0), True, 1),
     ),
@@ -1520,8 +1520,8 @@ def test_d128_single_query_forward_split_selector(capability, supported, expecte
 @pytest.mark.parametrize(
     ("capability", "supported", "expected"),
     (
-        ((10, 3), True, 22),
-        ((10, 7), True, 26),
+        ((10, 3), True, 13),
+        ((10, 7), True, 16),
         ((10, 7), False, 1),
         ((10, 0), True, 1),
     ),
@@ -1570,8 +1570,10 @@ def test_d128_single_query_auto_forward_split_matches_pytorch():
     )
     torch.cuda.synchronize()
 
-    expected_split = 1 if torch.cuda.get_device_capability() == (10, 3) else 2
-    assert next(iter(_interface.hstu_varlen_fwd_100.compile_cache))[-1] == expected_split
+    compile_key = next(iter(_interface.hstu_varlen_fwd_100.compile_cache))
+    assert compile_key[3] == 64
+    assert compile_key[13] == 1
+    assert compile_key[-1] == 5
     torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
 
 
@@ -1624,8 +1626,8 @@ def test_d128_single_query_auto_backward_matches_pytorch():
     expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
 
     assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
-    expected_split = {(10, 3): 22, (10, 7): 26}.get(torch.cuda.get_device_capability(), 1)
-    assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-1] == expected_split
+    expected_schedule = {(10, 3): (13, 2), (10, 7): (16, 2)}.get(torch.cuda.get_device_capability(), (1, 1))
+    assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-2:] == expected_schedule
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
 

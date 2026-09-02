@@ -388,7 +388,40 @@ def main() -> None:
     parser.add_argument("--direction", choices=("forward", "backward", "both"), default="both")
     parser.add_argument(
         "--forward-impl",
-        choices=("auto", "dispatch", "tc", "tc-split2", "tc-split4"),
+        choices=(
+            "auto",
+            "dispatch",
+            "tc",
+            "tc-split2",
+            "tc-split4",
+            "tc-m64",
+            "tc-m64-split2",
+            "tc-m64-split4",
+            "tc-m64-n64",
+            "tc-m64-n64-split2",
+            "tc-m64-n64-split4",
+            "tc-m64-warp1",
+            "tc-m64-warp1-split2",
+            "tc-m64-warp1-split4",
+            "tc-m64-warp2",
+            "tc-m64-warp2-split2",
+            "tc-m64-warp2-split4",
+            "tc-m64-warp3",
+            "tc-m64-warp3-split2",
+            "tc-m64-warp3-split4",
+            "tc-m64-inplace",
+            "tc-m64-inplace-split2",
+            "tc-m64-inplace-split4",
+            "tc-m64-16dp",
+            "tc-m64-16dp-split2",
+            "tc-m64-16dp-split4",
+            "tc-m64-16dp-tail-kv5",
+            "tc-m64-16dp-tail-kv5-split2",
+            "tc-m64-16dp-tail-kv5-split4",
+            "tc-epi1",
+            "tc-epi1-split2",
+            "tc-epi1-split4",
+        ),
         default="auto",
     )
     parser.add_argument(
@@ -405,6 +438,9 @@ def main() -> None:
             "direct-split26",
             "direct-split32",
             "direct-split64",
+            "direct-pair",
+            "direct-pair-split13",
+            "direct-pair-split16",
             "tc",
             "tc-small",
             "legacy",
@@ -487,7 +523,7 @@ def main() -> None:
                     dtype == torch.bfloat16 and args.head_dim == 128 and args.mask == "causal",
                 )
                 if split_kv > 1:
-                    selected_backward_impl = f"direct-split{split_kv}"
+                    selected_backward_impl = f"direct-pair-split{split_kv}"
                 case["selected_backward_impl"] = selected_backward_impl
             _, run, compile_seconds = _compile_backward(
                 tensors,

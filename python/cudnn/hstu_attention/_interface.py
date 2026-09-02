@@ -169,6 +169,7 @@ def _hstu_varlen_bwd_q1_direct(
     alpha: float,
     scaling_seqlen: float,
     split_kv: int,
+    rows_per_warp: int,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
@@ -199,7 +200,7 @@ def _hstu_varlen_bwd_q1_direct(
         # dQ reduction and short KV loop still have enough parallel work.
         num_threads = max(128, (num_threads // split_kv // 32) * 32)
 
-    compile_key = (q.device, q.dtype, num_threads, split_kv)
+    compile_key = (q.device, q.dtype, num_threads, split_kv, rows_per_warp)
     if compile_key not in _hstu_varlen_bwd_q1_direct.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             _mark_dynamic_tensor(tensor, tensor.ndim - 1) for tensor in (q, k, v, do, dq, dk, dv)
@@ -209,6 +210,7 @@ def _hstu_varlen_bwd_q1_direct(
             element_dtype=Float16 if q.dtype == torch.float16 else BFloat16,
             num_threads=num_threads,
             split_kv=split_kv,
+            rows_per_warp=rows_per_warp,
         )
         compile_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         with torch.cuda.nvtx.range("hstu_varlen_bwd_q1_kernel"):
@@ -272,15 +274,14 @@ def _select_q1_fwd_split_kv(
     capability: tuple[int, int],
     supported: bool,
 ) -> int:
-    """Resolve the fixed qlen=1 forward schedule for SM103/SM107."""
+    """Resolve explicit qlen=1 forward split-KV experiments."""
     if requested == "tc-split2":
         return 2
     if requested == "tc-split4":
         return 4
-    if requested != "auto" or not supported:
-        return 1
-    if capability == (10, 7):
-        return 2
+    # The general SM103/SM107 schedule is deliberately unsplit. Keeping these
+    # arguments makes the selector compatible with its existing call sites.
+    _ = capability, supported
     return 1
 
 
@@ -325,6 +326,9 @@ _Q1_BWD_DIRECT_SPLITS = {
     "direct-split26": 26,
     "direct-split32": 32,
     "direct-split64": 64,
+    "direct-pair": 1,
+    "direct-pair-split13": 13,
+    "direct-pair-split16": 16,
 }
 
 
@@ -339,9 +343,9 @@ def _select_q1_bwd_split_kv(
     if requested != "auto" or not supported:
         return 1
     if capability == (10, 3):
-        return 22
+        return 13
     if capability == (10, 7):
-        return 26
+        return 16
     return 1
 
 
@@ -379,8 +383,6 @@ def hstu_varlen_fwd_100(
     assert head_dim in (64, 128, 256), "Only support head_dim 64, 128 and 256"
 
     is_q_len_one = max_seqlen_q == 1
-    kBlockM = 128
-    kBlockN = 128
     window_size_left = max_seqlen_k if window_size_left < 0 or window_size_left > max_seqlen_k else window_size_left
     window_size_right = max_seqlen_k if window_size_right < 0 or window_size_right > max_seqlen_k else window_size_right
     is_causal = window_size_left == max_seqlen_k and window_size_right == 0
@@ -400,8 +402,78 @@ def hstu_varlen_fwd_100(
         and q.shape[1] == k.shape[1] == v.shape[1]
     )
     capability = _get_q1_device_capability(q.device)
+    # Keep one schedule per architecture across the measured batch, head-count,
+    # and KV-length range. Split-KV remains opt-in because its extra output
+    # atomics regress high-grid and short-KV cases.
+    if _q1_fwd_algorithm == "auto" and q1_split_supported and capability in ((10, 3), (10, 7)):
+        _q1_fwd_algorithm = "tc-m64-16dp-tail-kv5"
+    q1_m64_algorithm = _q1_fwd_algorithm in (
+        "tc-m64",
+        "tc-m64-split2",
+        "tc-m64-split4",
+        "tc-m64-n64",
+        "tc-m64-n64-split2",
+        "tc-m64-n64-split4",
+        "tc-m64-warp1",
+        "tc-m64-warp1-split2",
+        "tc-m64-warp1-split4",
+        "tc-m64-warp2",
+        "tc-m64-warp2-split2",
+        "tc-m64-warp2-split4",
+        "tc-m64-warp3",
+        "tc-m64-warp3-split2",
+        "tc-m64-warp3-split4",
+        "tc-m64-inplace",
+        "tc-m64-inplace-split2",
+        "tc-m64-inplace-split4",
+        "tc-m64-16dp",
+        "tc-m64-16dp-split2",
+        "tc-m64-16dp-split4",
+        "tc-m64-16dp-tail-kv5",
+        "tc-m64-16dp-tail-kv5-split2",
+        "tc-m64-16dp-tail-kv5-split4",
+    )
+    q1_m64_inplace_silu = "tc-m64-inplace" in _q1_fwd_algorithm or "tc-m64-16dp" in _q1_fwd_algorithm
+    q1_m64_16dp_silu = "tc-m64-16dp" in _q1_fwd_algorithm
+    q1_m64_tail_branch = "tc-m64-16dp-tail" in _q1_fwd_algorithm
+    q1_m64_kv_stage = 5 if "-kv5" in _q1_fwd_algorithm else 0
+    q1_m64_silu_warps = (
+        1 if "tc-m64-warp1" in _q1_fwd_algorithm else 2 if "tc-m64-warp2" in _q1_fwd_algorithm else 3 if "tc-m64-warp3" in _q1_fwd_algorithm else 0
+    )
+    q1_single_warp_epilogue = _q1_fwd_algorithm in ("tc-epi1", "tc-epi1-split2", "tc-epi1-split4")
+    kBlockM = 64 if q1_m64_algorithm else 128
+    kBlockN = 64 if "m64-n64" in _q1_fwd_algorithm else 128
+    q1_split_algorithm = {
+        "tc-m64": "tc",
+        "tc-m64-split2": "tc-split2",
+        "tc-m64-split4": "tc-split4",
+        "tc-m64-n64": "tc",
+        "tc-m64-n64-split2": "tc-split2",
+        "tc-m64-n64-split4": "tc-split4",
+        "tc-m64-warp1": "tc",
+        "tc-m64-warp1-split2": "tc-split2",
+        "tc-m64-warp1-split4": "tc-split4",
+        "tc-m64-warp2": "tc",
+        "tc-m64-warp2-split2": "tc-split2",
+        "tc-m64-warp2-split4": "tc-split4",
+        "tc-m64-warp3": "tc",
+        "tc-m64-warp3-split2": "tc-split2",
+        "tc-m64-warp3-split4": "tc-split4",
+        "tc-m64-inplace": "tc",
+        "tc-m64-inplace-split2": "tc-split2",
+        "tc-m64-inplace-split4": "tc-split4",
+        "tc-m64-16dp": "tc",
+        "tc-m64-16dp-split2": "tc-split2",
+        "tc-m64-16dp-split4": "tc-split4",
+        "tc-m64-16dp-tail-kv5": "tc",
+        "tc-m64-16dp-tail-kv5-split2": "tc-split2",
+        "tc-m64-16dp-tail-kv5-split4": "tc-split4",
+        "tc-epi1": "tc",
+        "tc-epi1-split2": "tc-split2",
+        "tc-epi1-split4": "tc-split4",
+    }.get(_q1_fwd_algorithm, _q1_fwd_algorithm)
     q1_split_kv = _select_q1_fwd_split_kv(
-        _q1_fwd_algorithm,
+        q1_split_algorithm,
         capability,
         q1_split_supported,
     )
@@ -410,6 +482,8 @@ def hstu_varlen_fwd_100(
     use_2cta_instrs = (
         (not is_q_len_one or batch_size < 256)
         and q1_split_kv == 1
+        and kBlockM == 128
+        and not q1_single_warp_epilogue
         and capability == (10, 7)
         and head_dim == 128
         and is_causal
@@ -440,10 +514,42 @@ def hstu_varlen_fwd_100(
             raise ValueError("out must have the same dtype and device as q")
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
-    if _q1_fwd_algorithm not in ("auto", "tc", "tc-split2", "tc-split4"):
+    if _q1_fwd_algorithm not in (
+        "auto",
+        "tc",
+        "tc-split2",
+        "tc-split4",
+        "tc-m64",
+        "tc-m64-split2",
+        "tc-m64-split4",
+        "tc-m64-n64",
+        "tc-m64-n64-split2",
+        "tc-m64-n64-split4",
+        "tc-m64-warp1",
+        "tc-m64-warp1-split2",
+        "tc-m64-warp1-split4",
+        "tc-m64-warp2",
+        "tc-m64-warp2-split2",
+        "tc-m64-warp2-split4",
+        "tc-m64-warp3",
+        "tc-m64-warp3-split2",
+        "tc-m64-warp3-split4",
+        "tc-m64-inplace",
+        "tc-m64-inplace-split2",
+        "tc-m64-inplace-split4",
+        "tc-m64-16dp",
+        "tc-m64-16dp-split2",
+        "tc-m64-16dp-split4",
+        "tc-m64-16dp-tail-kv5",
+        "tc-m64-16dp-tail-kv5-split2",
+        "tc-m64-16dp-tail-kv5-split4",
+        "tc-epi1",
+        "tc-epi1-split2",
+        "tc-epi1-split4",
+    ):
         raise ValueError(f"Unsupported qlen=1 forward algorithm: {_q1_fwd_algorithm}")
-    if _q1_fwd_algorithm in ("tc-split2", "tc-split4") and not q1_split_supported:
-        raise ValueError("The split-KV qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
+    if (q1_split_kv > 1 or q1_m64_algorithm or q1_single_warp_epilogue) and not q1_split_supported:
+        raise ValueError("The specialized qlen=1 forward algorithms require causal BF16 D=128 qlen=1 with matching Q/K/V heads")
     compile_key = (
         q.device,
         q_dtype,
@@ -459,6 +565,12 @@ def hstu_varlen_fwd_100(
         use_2cta_instrs,
         use_clc_descriptor,
         q1_split_kv,
+        q1_single_warp_epilogue,
+        q1_m64_silu_warps,
+        q1_m64_inplace_silu,
+        q1_m64_16dp_silu,
+        q1_m64_tail_branch,
+        q1_m64_kv_stage,
     )
 
     block_sparse_tensors = None
@@ -521,6 +633,12 @@ def hstu_varlen_fwd_100(
             use_clc_descriptor=use_clc_descriptor,
             is_q_len_one=is_q_len_one and not use_2cta_instrs,
             q1_split_kv=q1_split_kv,
+            q1_single_warp_epilogue=q1_single_warp_epilogue,
+            q1_m64_silu_warps=q1_m64_silu_warps,
+            q1_m64_inplace_silu=q1_m64_inplace_silu,
+            q1_m64_16dp_silu=q1_m64_16dp_silu,
+            q1_m64_tail_branch=q1_m64_tail_branch,
+            q1_m64_kv_stage=q1_m64_kv_stage,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
             hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(
@@ -653,12 +771,13 @@ def hstu_varlen_bwd_100(
         q1_direct_supported and q_dtype == torch.bfloat16,
     )
     if _q1_bwd_algorithm == "auto" and q1_bwd_split_kv > 1:
-        selected_q1_bwd_algorithm = "direct"
+        selected_q1_bwd_algorithm = "direct-pair"
     elif q1_direct_supported:
         selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device)
     else:
         selected_q1_bwd_algorithm = _q1_bwd_algorithm
     use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS
+    q1_rows_per_warp = 2 if selected_q1_bwd_algorithm.startswith("direct-pair") else 1
     use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
     use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"
     if use_q1_direct_kernel:
@@ -672,6 +791,7 @@ def hstu_varlen_bwd_100(
             alpha,
             scaling_seqlen,
             q1_bwd_split_kv,
+            q1_rows_per_warp,
             dq,
             dk,
             dv,

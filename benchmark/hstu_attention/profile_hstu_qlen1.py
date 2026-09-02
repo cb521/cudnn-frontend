@@ -28,7 +28,21 @@ def main() -> None:
     parser.add_argument("--mask", choices=("causal", "full"), default="causal")
     parser.add_argument(
         "--forward-impl",
-        choices=("dispatch", "tc", "tc-split2", "tc-split4"),
+        choices=(
+            "dispatch",
+            "tc",
+            "tc-split2",
+            "tc-split4",
+            "tc-m64",
+            "tc-m64-split2",
+            "tc-m64-warp1",
+            "tc-m64-16dp",
+            "tc-m64-16dp-split2",
+            "tc-m64-16dp-split4",
+            "tc-m64-16dp-tail-kv5",
+            "tc-m64-16dp-tail-kv5-split2",
+            "tc-m64-16dp-tail-kv5-split4",
+        ),
         default="dispatch",
     )
     parser.add_argument(
@@ -44,6 +58,9 @@ def main() -> None:
             "direct-split26",
             "direct-split32",
             "direct-split64",
+            "direct-pair",
+            "direct-pair-split13",
+            "direct-pair-split16",
             "tc",
             "tc-small",
             "legacy",

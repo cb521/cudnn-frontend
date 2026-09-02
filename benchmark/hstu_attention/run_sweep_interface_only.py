@@ -132,7 +132,7 @@ cudnn_package.HSTUBwdSm100 = HSTUBwdSm100
 cudnn_package.HSTUFwdSm100 = HSTUFwdSm100
 benchmark_root = driver_root / "benchmark" / "hstu_attention"
 driver_name = os.environ.get("HSTU_BENCHMARK_DRIVER", "sweep_hstu_qlen1.py")
-if driver_name not in ("benchmark_hstu_qlen1.py", "sweep_hstu_qlen1.py"):
+if driver_name not in ("benchmark_hstu_qlen1.py", "sweep_hstu_qlen1.py", "profile_hstu_qlen1.py"):
     raise ValueError(f"Unsupported HSTU benchmark driver: {driver_name}")
 sys.path.insert(0, str(benchmark_root))
 runpy.run_path(str(benchmark_root / driver_name), run_name="__main__")

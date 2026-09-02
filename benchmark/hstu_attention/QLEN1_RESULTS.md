@@ -20,35 +20,36 @@ heads, average KV lengths 128 through 4096, and opposite low-grid/long-KV and
 high-grid/short-KV corners. Every case uses variable per-sequence KV lengths.
 Each case has equal weight in the geometric-mean speedup.
 
-Baseline and candidate were measured in both process orders on the same B300
-and Rubin allocations. Candidate alternatives were also rerun with their
-measurement order reversed. The selection rule was: no case may regress
-against the original kernel, then maximize the geometric-mean speedup. This
-produces one fixed schedule per architecture and direction; batch size, head
-count, average KV length, and packed total KV no longer select a schedule.
+Candidate alternatives were measured in rotating, interleaved groups on the
+same B300 and Rubin allocations. The selected automatic paths were then rerun
+standalone over all 36 cases and compared with commit `8baf903`. The selection
+rule was: no case may regress against the original kernel, then maximize the
+geometric-mean speedup. This produces one fixed schedule per architecture and
+direction; batch size, head count, average KV length, and packed total KV no
+longer select a schedule.
 
 | GPU | Direction | Fixed qlen=1 schedule | Geomean speedup | Slowest case | Regressions |
 | --- | --- | --- | ---: | ---: | ---: |
-| B300 (SM10.3) | Forward | M128/N128 tensor core, unsplit | 1.461x | 1.196x | 0 / 36 |
-| Rubin (SM10.7) | Forward | M128/N128 tensor core, split2 | 1.182x | 1.050x | 0 / 36 |
-| B300 (SM10.3) | Backward | CUDA core, Q-major, split22 | 2.061x | 1.602x | 0 / 36 |
-| Rubin (SM10.7) | Backward | CUDA core, Q-major, split26 | 1.729x | 1.398x | 0 / 36 |
+| B300 (SM10.3) | Forward | M64/N128 tensor core, 5-stage KV, unsplit | 1.537x | 1.052x | 0 / 36 |
+| Rubin (SM10.7) | Forward | M64/N128 tensor core, 5-stage KV, unsplit | 1.454x | 1.043x | 0 / 36 |
+| B300 (SM10.3) | Backward | CUDA core, 2 KV rows/warp, split13 | 2.230x | 1.570x | 0 / 36 |
+| Rubin (SM10.7) | Backward | CUDA core, 2 KV rows/warp, split16 | 2.219x | 1.502x | 0 / 36 |
 
-Across both architectures, the equal-weight geometric means are 1.314x for
-forward and 1.888x for backward. At the requested H=4, D=128, average-KV=2048
-points, the order-balanced measurements are:
+Across both architectures, the equal-weight geometric means are 1.495x for
+forward and 2.224x for backward. At the requested H=4, D=128, average-KV=2048
+points, the final standalone measurements are:
 
 | GPU | Batch | Forward original -> fixed (ms) | Speedup | Backward original -> fixed (ms) | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| B300 | 64 | 0.0789 -> 0.0553 | 1.43x | 0.2300 -> 0.1224 | 1.88x |
-| B300 | 512 | 0.4213 -> 0.3203 | 1.32x | 1.7653 -> 0.8457 | 2.09x |
-| B300 | 1024 | 1.0293 -> 0.6495 | 1.58x | 3.5315 -> 1.6859 | 2.09x |
-| Rubin | 64 | 0.0443 -> 0.0399 | 1.11x | 0.1435 -> 0.0898 | 1.60x |
-| Rubin | 512 | 0.2331 -> 0.2170 | 1.07x | 1.0301 -> 0.6203 | 1.66x |
-| Rubin | 1024 | 0.4754 -> 0.4224 | 1.13x | 2.0481 -> 1.2266 | 1.67x |
+| B300 | 64 | 0.0808 -> 0.0513 | 1.58x | 0.2348 -> 0.1136 | 2.07x |
+| B300 | 512 | 0.4174 -> 0.3132 | 1.33x | 1.7751 -> 0.7698 | 2.31x |
+| B300 | 1024 | 0.8335 -> 0.6137 | 1.36x | 3.5462 -> 1.5301 | 2.32x |
+| Rubin | 64 | 0.0443 -> 0.0378 | 1.17x | 0.1476 -> 0.0696 | 2.12x |
+| Rubin | 512 | 0.2068 -> 0.1726 | 1.20x | 1.0972 -> 0.4431 | 2.48x |
+| Rubin | 1024 | 0.4106 -> 0.3320 | 1.24x | 2.2278 -> 0.8909 | 2.50x |
 
-The final automatic path matches the forced selected kernel within 0.1% in
-geometric mean. The specialized policy applies only to causal BF16 qlen=1,
+The final automatic path was rechecked after removing the rejected tuning
+variants. The specialized policy applies only to causal BF16 qlen=1,
 D=128, matching Q/K/V heads, and supported direct layouts. Other dtypes,
 dimensions, masks, paged KV, and unsupported layouts stay on the existing
 general dispatch paths.
@@ -101,8 +102,9 @@ groups of 30 executions:
 | Rubin | 1024 | 0.4317 | 0.4224 (`split2`) | 1.02x |
 
 These early per-shape boundaries were useful for proving the split-KV idea,
-but are superseded by the fixed broad-sweep policy above. Production now uses
-unsplit TC on B300 and split2 TC on Rubin for every supported target shape.
+but are superseded by the fixed broad-sweep policy above. The later M64
+five-stage kernel is fast enough that production now uses unsplit TC on both
+architectures; fixed split2 regresses short-KV and already-large-grid cases.
 
 ## Forward tile-shape experiment
 
@@ -220,9 +222,27 @@ partially hidden. The M64 path loses because it fails to reduce issued MMA
 instructions and adds mapping overhead, not because reducing arithmetic can
 never help.
 
-The production dispatch therefore remains M128/N128. The reproducible M64,
-N64, and epilogue variants live on the
-`experiment/hstu-qlen1-fwd-m64` branch and are not selected automatically.
+### Final M64 five-stage follow-up
+
+The first M64 result above used the inherited three-stage KV ring and paid the
+new TMEM mapping overhead on every block. The final follow-up keeps N128 but
+makes two independent changes: full blocks skip per-element tail predicates,
+and the smaller M64 Q/O footprint is reinvested in a five-stage KV ring. On a
+B300 BS=1024 NCU comparison, increasing M64 from three to five stages lowers
+duration from 677.6 to 629.4 us, lowers long-scoreboard cycles per issued
+instruction from 8.67 to 7.87, and raises measured memory throughput from
+6.35 to 6.84 TB/s. Registers and occupancy stay unchanged. Six stages do not
+help B300 and leave too little shared-memory margin, so five is the fixed
+cross-architecture choice.
+
+Across the interleaved 36-case sweep, the final M64/five-stage path is 1.075x
+faster than M128 on B300 and 1.159x faster on Rubin in geometric mean. The
+single worst paired ratios are 0.998x and 0.992x, within run-to-run noise; the
+standalone original-kernel comparison is positive in all 36 cases on both
+architectures. M64/N128 with five KV stages and no split is therefore selected
+automatically for the supported workload. N64 and the wider-TMEM experiments
+remain rejected because their extra loop or register cost outweighs reduced
+nominal work.
 
 ## Small-MMA Q-major backward
 
@@ -400,13 +420,12 @@ The complete direct-path progression is:
 | Rubin | 512 | 0.8042 | 0.7227 | 0.6266 (16 warps) | -22.1% |
 | Rubin | 1024 | 1.4247 | 1.3462 | 1.1806 (16 warps) | -17.1% |
 
-Two rejected variants confirm the resource tradeoff. Holding two KV rows per
-warp improved BS=64 by about 4%, but its extra registers slowed BS=512/1024 by
-about 5%. Before vectorization, a 384-thread CTA was slower than 512 threads;
-after vectorization changed the register footprint, retuning made 384 threads
-best for large B300 grids. A 1024-thread CTA reduces CTA residency and remains
-much slower at large batch sizes. Vector loads with scalar stores were also
-rejected: the scalar stores raise final B300 BS=1024 from 1.74 to 2.09 ms.
+Several rejected variants confirm the resource tradeoff. Before vectorization,
+a 384-thread CTA was slower than 512 threads; after vectorization changed the
+register footprint, retuning made 384 threads best for large B300 grids. A
+1024-thread CTA reduces CTA residency and remains much slower at large batch
+sizes. Vector loads with scalar stores were also rejected: the scalar stores
+raise final B300 BS=1024 from 1.74 to 2.09 ms.
 
 ### Historical per-shape split-KV direct backward
 
@@ -426,8 +445,9 @@ crossover; Rubin requires at least split16 because its unsplit direct kernel
 is already faster at large grids.
 
 The following early automatic choices and same-allocation comparisons used 10
-warmups and the median of five groups of 30 executions. They are superseded by
-the fixed split22/split26 policy from the 36-case sweep:
+warmups and the median of five groups of 30 executions. They were first
+superseded by fixed split22/split26, then by the final two-row split13/split16
+policy from the 36-case sweep:
 
 | GPU | Batch | Previous dispatch (ms) | Split selection | Final (ms) | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -457,6 +477,37 @@ library (`Failed to initialize LOP`, `LibraryNotLoaded`) with driver 615.12.
 Rubin therefore uses the same kernel-structure diagnosis from B300 plus direct
 before/after timing and correctness measurements on SM107.
 
+### Two KV rows per warp
+
+The final backward pass divides each warp into two 16-lane groups. Each group
+owns one KV row, loads/stores eight adjacent BF16 values per lane with one
+128-bit transaction, performs width-16 QK and dO-V reductions, and writes its
+disjoint dK/dV row directly. The two groups combine their accumulated dQ in
+registers before the existing CTA reduction. The high-level loop order is
+unchanged; split-KV still introduces only the packed dQ atomic reduction.
+
+A same-split B300 NCU comparison isolates this change at BS=1024:
+
+| Metric | 1 KV row/warp, split22 | 2 KV rows/warp, split22 |
+| --- | ---: | ---: |
+| Kernel duration | 2.132 ms | 1.918 ms |
+| Executed instructions | 952.96 M | 752.86 M |
+| Estimated DRAM bytes | 8.648 GB | 8.648 GB |
+| Long-scoreboard cycles / issued instruction | 7.76 | 6.07 |
+| Registers / thread | 44 | 72 |
+| Grid CTAs | 90,112 | 90,112 |
+
+Thus pairing itself is 1.112x faster with identical grid, split count, and
+memory volume. Retuning the fixed split from 22 to 13 lowers the same NCU run
+further to 1.848 ms. The 36-case interleaved sweep improves over the previous
+optimized automatic path by 1.064x on B300 with fixed split13 and 1.208x on
+Rubin with fixed split16; all 36 cases improve on both architectures.
+
+Four KV rows per warp was also implemented with two 128-bit transactions per
+lane. It helps the low-grid BS=64 target by roughly 5--7%, but is slower at
+BS=512/1024 and increases the boundary-oracle error by about two orders of
+magnitude. It is rejected rather than adding another shape-dependent branch.
+
 ### Rejected forward residency experiment
 
 The qlen=1 Q and output shared-memory lifetimes can be made disjoint. Reusing
@@ -469,16 +520,16 @@ experiment is retained.
 
 ## Design
 
-The forward kernel uses one Q stage for a one-token query, removing the
-second fully masked 128-row Q tile. B300 always uses the unsplit M128/N128
-tensor-core schedule for the supported target, while Rubin always uses two KV
-partitions and atomically combines their partial outputs in the epilogue.
+The forward kernel uses one Q stage for a one-token query, a native M64 TMEM
+mapping, tail-only masking, and a five-stage KV pipeline. Both architectures
+use the unsplit M64/N128 tensor-core schedule for every supported shape.
 
 Backward always uses the vectorized Q-major CUDA-core `hstu_bwd_q1.py` for the
-supported target. B300 splits the KV range 22 ways and Rubin splits it 26
-ways. Each CTA writes disjoint dK/dV rows directly; only dQ is atomically
-combined. Unsupported layouts, non-causal or arbitrary masks, FP16, and other
-head dimensions keep the existing implementation.
+supported target. A warp handles two KV rows with two 16-lane groups. B300
+splits the KV range 13 ways and Rubin splits it 16 ways. Each CTA writes
+disjoint dK/dV rows directly; only dQ is atomically combined. Unsupported
+layouts, non-causal or arbitrary masks, FP16, and other head dimensions keep
+the existing implementation.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.
@@ -493,7 +544,7 @@ forced-path test checks `tc-small` against `tc` at KV lengths
 and Rubin. Forced `split2` and `split4` forward runs pass the boundary-heavy
 forward oracle on both architectures; the largest observed forward absolute
 error is below `1.6e-5`. Forced backward split8, split16, split22, split26,
-and split64 runs pass on the tested architectures. The final automatic
-split22/split26 boundary oracle has maximum absolute errors below `3.8e-5`
+and split64 runs pass on the tested architectures. The final two-row automatic
+split13/split16 boundary oracle has maximum absolute errors below `2.6e-5`
 for dQ and `1e-6` for dK/dV. BF16 dQ atomic ordering accounts for the larger
 dQ error.

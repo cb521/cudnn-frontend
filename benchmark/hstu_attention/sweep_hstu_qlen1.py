@@ -15,6 +15,7 @@ import gc
 import json
 import os
 from pathlib import Path
+import statistics
 
 import torch
 
@@ -82,6 +83,11 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--groups", type=int, default=3)
+    parser.add_argument(
+        "--interleave",
+        action="store_true",
+        help="compile all implementations first, then rotate their timing order for every group",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -108,6 +114,7 @@ def main() -> None:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "groups": args.groups,
+        "interleave": args.interleave,
         "cases": [],
     }
 
@@ -139,6 +146,7 @@ def main() -> None:
         # first while the device is changing clocks or temperature.
         rotate = case_index % len(args.implementations)
         implementations = args.implementations[rotate:] + args.implementations[:rotate]
+        compiled: dict[str, tuple[object, object, float]] = {}
         for implementation in implementations:
             try:
                 if args.direction == "forward":
@@ -159,12 +167,15 @@ def main() -> None:
                         scaling_seqlen,
                         implementation,
                     )
-                measurement = {
-                    "compile_seconds": compile_seconds,
-                    **_measure_ms(run, args.warmup, args.iterations, args.groups),
-                }
-                case_result["results"][implementation] = measurement
-                del outputs, run
+                if args.interleave:
+                    compiled[implementation] = (outputs, run, compile_seconds)
+                else:
+                    measurement = {
+                        "compile_seconds": compile_seconds,
+                        **_measure_ms(run, args.warmup, args.iterations, args.groups),
+                    }
+                    case_result["results"][implementation] = measurement
+                    del outputs, run
             except Exception as exc:  # Keep a long sweep useful after one failed variant.
                 case_result["results"][implementation] = {
                     "error": f"{type(exc).__name__}: {exc}",
@@ -184,6 +195,37 @@ def main() -> None:
                     flush=True,
                 )
                 torch.cuda.empty_cache()
+
+        if args.interleave and compiled:
+            for _ in range(args.warmup):
+                for implementation in implementations:
+                    if implementation in compiled:
+                        compiled[implementation][1]()
+            torch.cuda.synchronize()
+            samples: dict[str, list[float]] = {implementation: [] for implementation in compiled}
+            active = [implementation for implementation in implementations if implementation in compiled]
+            for group_idx in range(args.groups):
+                group_rotate = group_idx % len(active)
+                group_order = active[group_rotate:] + active[:group_rotate]
+                for implementation in group_order:
+                    run = compiled[implementation][1]
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(args.iterations):
+                        run()
+                    end.record()
+                    end.synchronize()
+                    samples[implementation].append(start.elapsed_time(end) / args.iterations)
+            for implementation, implementation_samples in samples.items():
+                case_result["results"][implementation] = {
+                    "compile_seconds": compiled[implementation][2],
+                    "median_ms": statistics.median(implementation_samples),
+                    "min_ms": min(implementation_samples),
+                    "max_ms": max(implementation_samples),
+                    "samples_ms": implementation_samples,
+                }
+            compiled.clear()
 
         print("CASE " + json.dumps(case_result, sort_keys=True), flush=True)
         payload["cases"].append(case_result)
