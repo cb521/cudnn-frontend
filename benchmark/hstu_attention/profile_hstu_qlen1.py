@@ -40,6 +40,8 @@ def main() -> None:
             "direct-split4",
             "direct-split8",
             "direct-split16",
+            "direct-split22",
+            "direct-split26",
             "direct-split32",
             "direct-split64",
             "tc",

@@ -1504,24 +1504,30 @@ def test_varlen_tail_and_asymmetric_lengths_match_pytorch(head_dim):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    ("capability", "batch_size", "average_seqlen_k", "supported", "expected"),
+    ("capability", "supported", "expected"),
     (
-        ((10, 3), 64, 2048, True, 4),
-        ((10, 3), 256, 2048, True, 4),
-        ((10, 3), 512, 2048, True, 2),
-        ((10, 3), 1024, 2048, True, 1),
-        ((10, 3), 64, 1024, True, 1),
-        ((10, 7), 64, 2048, True, 4),
-        ((10, 7), 128, 2048, True, 4),
-        ((10, 7), 256, 2048, True, 2),
-        ((10, 7), 1024, 2048, True, 2),
-        ((10, 7), 2048, 2048, True, 1),
-        ((10, 7), 64, 2048, False, 1),
-        ((10, 0), 64, 2048, True, 1),
+        ((10, 3), True, 1),
+        ((10, 7), True, 2),
+        ((10, 7), False, 1),
+        ((10, 0), True, 1),
     ),
 )
-def test_d128_single_query_forward_split_selector(capability, batch_size, average_seqlen_k, supported, expected):
-    assert _interface._select_q1_fwd_split_kv("auto", capability, batch_size, average_seqlen_k, supported) == expected
+def test_d128_single_query_forward_split_selector(capability, supported, expected):
+    assert _interface._select_q1_fwd_split_kv("auto", capability, supported) == expected
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    ("capability", "supported", "expected"),
+    (
+        ((10, 3), True, 22),
+        ((10, 7), True, 26),
+        ((10, 7), False, 1),
+        ((10, 0), True, 1),
+    ),
+)
+def test_d128_single_query_backward_split_selector(capability, supported, expected):
+    assert _interface._select_q1_bwd_split_kv("auto", capability, supported) == expected
 
 
 @pytest.mark.L0
@@ -1564,7 +1570,8 @@ def test_d128_single_query_auto_forward_split_matches_pytorch():
     )
     torch.cuda.synchronize()
 
-    assert next(iter(_interface.hstu_varlen_fwd_100.compile_cache))[-1] == 4
+    expected_split = 1 if torch.cuda.get_device_capability() == (10, 3) else 2
+    assert next(iter(_interface.hstu_varlen_fwd_100.compile_cache))[-1] == expected_split
     torch.testing.assert_close(actual.float(), expected, rtol=4e-2, atol=4e-2)
 
 
@@ -1616,9 +1623,9 @@ def test_d128_single_query_auto_backward_matches_pytorch():
     )
     expected = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), do.cpu().float())
 
-    selected = _interface._select_q1_bwd_algorithm("auto", batch, q.device)
-    selected_cache = _interface._hstu_varlen_bwd_q1_direct.compile_cache if selected == "direct" else _interface.hstu_varlen_bwd_100.compile_cache
-    assert len(selected_cache) == 1
+    assert len(_interface._hstu_varlen_bwd_q1_direct.compile_cache) == 1
+    expected_split = {(10, 3): 22, (10, 7): 26}.get(torch.cuda.get_device_capability(), 1)
+    assert next(iter(_interface._hstu_varlen_bwd_q1_direct.compile_cache))[-1] == expected_split
     for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected):
         torch.testing.assert_close(actual[name].cpu().float(), expected_grad, rtol=8e-2, atol=8e-2)
 

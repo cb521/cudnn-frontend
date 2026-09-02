@@ -5,6 +5,8 @@
 
 Set ``HSTU_SOURCE_ROOT`` to benchmark another source tree (for example the
 pre-optimization baseline) while keeping this sweep driver unchanged.
+``HSTU_BENCHMARK_DRIVER`` may select either the broad sweep or the focused
+correctness/target benchmark.
 """
 
 from __future__ import annotations
@@ -128,8 +130,9 @@ class HSTUFwdSm100:
 
 cudnn_package.HSTUBwdSm100 = HSTUBwdSm100
 cudnn_package.HSTUFwdSm100 = HSTUFwdSm100
-sys.path.insert(0, str(driver_root / "benchmark" / "hstu_attention"))
-runpy.run_path(
-    str(driver_root / "benchmark" / "hstu_attention" / "sweep_hstu_qlen1.py"),
-    run_name="__main__",
-)
+benchmark_root = driver_root / "benchmark" / "hstu_attention"
+driver_name = os.environ.get("HSTU_BENCHMARK_DRIVER", "sweep_hstu_qlen1.py")
+if driver_name not in ("benchmark_hstu_qlen1.py", "sweep_hstu_qlen1.py"):
+    raise ValueError(f"Unsupported HSTU benchmark driver: {driver_name}")
+sys.path.insert(0, str(benchmark_root))
+runpy.run_path(str(benchmark_root / driver_name), run_name="__main__")

@@ -270,25 +270,17 @@ def _get_q1_device_capability(device: torch.device) -> tuple[int, int]:
 def _select_q1_fwd_split_kv(
     requested: str,
     capability: tuple[int, int],
-    batch_size: int,
-    average_seqlen_k: int,
     supported: bool,
 ) -> int:
-    """Resolve the measured qlen=1 split-KV crossover for SM103/SM107."""
+    """Resolve the fixed qlen=1 forward schedule for SM103/SM107."""
     if requested == "tc-split2":
         return 2
     if requested == "tc-split4":
         return 4
-    if requested != "auto" or not supported or average_seqlen_k < 1536:
+    if requested != "auto" or not supported:
         return 1
-    if capability == (10, 3):
-        if batch_size <= 256:
-            return 4
-        return 2 if batch_size <= 512 else 1
     if capability == (10, 7):
-        if batch_size <= 128:
-            return 4
-        return 2 if batch_size <= 1024 else 1
+        return 2
     return 1
 
 
@@ -297,7 +289,7 @@ def _select_q1_bwd_algorithm(
     batch_size: int,
     device: torch.device,
 ) -> str:
-    """Resolve the qlen=1 implementation from measured SM10x crossovers."""
+    """Resolve the non-split qlen=1 fallback from measured SM10x crossovers."""
     if requested != "auto":
         return requested
 
@@ -329,6 +321,8 @@ _Q1_BWD_DIRECT_SPLITS = {
     "direct-split4": 4,
     "direct-split8": 8,
     "direct-split16": 16,
+    "direct-split22": 22,
+    "direct-split26": 26,
     "direct-split32": 32,
     "direct-split64": 64,
 }
@@ -337,34 +331,18 @@ _Q1_BWD_DIRECT_SPLITS = {
 def _select_q1_bwd_split_kv(
     requested: str,
     capability: tuple[int, int],
-    batch_size: int,
-    num_heads: int,
-    average_seqlen_k: int,
     supported: bool,
 ) -> int:
-    """Resolve the measured direct-backward split-KV schedule."""
+    """Resolve the fixed qlen=1 direct-backward schedule."""
     if requested in _Q1_BWD_DIRECT_SPLITS:
         return _Q1_BWD_DIRECT_SPLITS[requested]
-    if requested != "auto" or not supported or average_seqlen_k < 1536:
+    if requested != "auto" or not supported:
         return 1
-
-    # At the target average KV length, B300 benefits until the requested grid
-    # reaches roughly 32K short CTAs. Rubin reaches its crossover one step
-    # earlier. Keep at least 32 average KV rows per CTA so fixed CTA and dQ
-    # reduction costs do not dominate.
-    base_ctas = max(batch_size * num_heads, 1)
-    desired_split = 32768 // base_ctas
     if capability == (10, 3):
-        minimum_useful_split = 8
-    elif capability == (10, 7):
-        minimum_useful_split = 16
-    else:
-        return 1
-    if desired_split < minimum_useful_split:
-        return 1
-    max_split_for_work = max((average_seqlen_k + 31) // 32, 1)
-    split_kv = min(desired_split, max_split_for_work, 64)
-    return 1 << (split_kv.bit_length() - 1)
+        return 22
+    if capability == (10, 7):
+        return 26
+    return 1
 
 
 def hstu_varlen_fwd_100(
@@ -425,8 +403,6 @@ def hstu_varlen_fwd_100(
     q1_split_kv = _select_q1_fwd_split_kv(
         _q1_fwd_algorithm,
         capability,
-        batch_size,
-        k.shape[0] // max(batch_size, 1),
         q1_split_supported,
     )
     # Rubin's two-CTA path supplies useful occupancy for the small qlen=1
@@ -674,14 +650,14 @@ def hstu_varlen_bwd_100(
     q1_bwd_split_kv = _select_q1_bwd_split_kv(
         _q1_bwd_algorithm,
         capability,
-        batch_size,
-        num_heads,
-        k.shape[0] // max(batch_size, 1),
         q1_direct_supported and q_dtype == torch.bfloat16,
     )
-    selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device) if q1_direct_supported else _q1_bwd_algorithm
     if _q1_bwd_algorithm == "auto" and q1_bwd_split_kv > 1:
         selected_q1_bwd_algorithm = "direct"
+    elif q1_direct_supported:
+        selected_q1_bwd_algorithm = _select_q1_bwd_algorithm(_q1_bwd_algorithm, batch_size, q.device)
+    else:
+        selected_q1_bwd_algorithm = _q1_bwd_algorithm
     use_q1_direct_kernel = q1_direct_supported and selected_q1_bwd_algorithm in _Q1_BWD_DIRECT_SPLITS
     use_q_major_scheduler = selected_q1_bwd_algorithm in ("tc", "tc-small")
     use_q1_small_mma = selected_q1_bwd_algorithm == "tc-small"

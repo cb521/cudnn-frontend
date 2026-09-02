@@ -10,8 +10,48 @@
 
 `benchmark_hstu_qlen1.py` uses 10 warmup iterations and reports the median of
 seven groups of 30 executions. The baseline is commit `8baf903`, which adds
-only the benchmark on top of the original HSTU kernel. Baseline and candidate
-were run sequentially in the same allocation.
+only the benchmark on top of the original HSTU kernel.
+
+## Broad-sweep final policy
+
+The final selection uses `sweep_hstu_qlen1.py` rather than the three target
+points alone. Its 36 unique cases cover batch sizes 16 through 2048, 1/2/4/8
+heads, average KV lengths 128 through 4096, and opposite low-grid/long-KV and
+high-grid/short-KV corners. Every case uses variable per-sequence KV lengths.
+Each case has equal weight in the geometric-mean speedup.
+
+Baseline and candidate were measured in both process orders on the same B300
+and Rubin allocations. Candidate alternatives were also rerun with their
+measurement order reversed. The selection rule was: no case may regress
+against the original kernel, then maximize the geometric-mean speedup. This
+produces one fixed schedule per architecture and direction; batch size, head
+count, average KV length, and packed total KV no longer select a schedule.
+
+| GPU | Direction | Fixed qlen=1 schedule | Geomean speedup | Slowest case | Regressions |
+| --- | --- | --- | ---: | ---: | ---: |
+| B300 (SM10.3) | Forward | M128/N128 tensor core, unsplit | 1.461x | 1.196x | 0 / 36 |
+| Rubin (SM10.7) | Forward | M128/N128 tensor core, split2 | 1.182x | 1.050x | 0 / 36 |
+| B300 (SM10.3) | Backward | CUDA core, Q-major, split22 | 2.061x | 1.602x | 0 / 36 |
+| Rubin (SM10.7) | Backward | CUDA core, Q-major, split26 | 1.729x | 1.398x | 0 / 36 |
+
+Across both architectures, the equal-weight geometric means are 1.314x for
+forward and 1.888x for backward. At the requested H=4, D=128, average-KV=2048
+points, the order-balanced measurements are:
+
+| GPU | Batch | Forward original -> fixed (ms) | Speedup | Backward original -> fixed (ms) | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B300 | 64 | 0.0789 -> 0.0553 | 1.43x | 0.2300 -> 0.1224 | 1.88x |
+| B300 | 512 | 0.4213 -> 0.3203 | 1.32x | 1.7653 -> 0.8457 | 2.09x |
+| B300 | 1024 | 1.0293 -> 0.6495 | 1.58x | 3.5315 -> 1.6859 | 2.09x |
+| Rubin | 64 | 0.0443 -> 0.0399 | 1.11x | 0.1435 -> 0.0898 | 1.60x |
+| Rubin | 512 | 0.2331 -> 0.2170 | 1.07x | 1.0301 -> 0.6203 | 1.66x |
+| Rubin | 1024 | 0.4754 -> 0.4224 | 1.13x | 2.0481 -> 1.2266 | 1.67x |
+
+The final automatic path matches the forced selected kernel within 0.1% in
+geometric mean. The specialized policy applies only to causal BF16 qlen=1,
+D=128, matching Q/K/V heads, and supported direct layouts. Other dtypes,
+dimensions, masks, paged KV, and unsupported layouts stay on the existing
+general dispatch paths.
 
 ## Initial forward and direct-path results
 
@@ -34,7 +74,7 @@ backward path. The final backward dispatch is reported below.
 | 512 | 0.2285 | 0.2249 | 1.02x | 1.0261 | 0.8069 | 1.27x |
 | 1024 | 0.4557 | 0.4322 | 1.05x | 2.0375 | 1.4264 | 1.43x |
 
-## Split-KV forward
+## Historical per-shape split-KV forward experiment
 
 The qlen=1 HSTU output is additive across KV partitions: each partition can
 compute `silu(alpha * QK^T) @ V / scaling_seqlen` independently, without the
@@ -60,11 +100,9 @@ groups of 30 executions:
 | Rubin | 512 | 0.2238 | 0.2170 (`split2`) | 1.03x |
 | Rubin | 1024 | 0.4317 | 0.4224 (`split2`) | 1.02x |
 
-Extra batch-size sweeps set the dispatch boundaries. B300 uses `split4`
-through BS=256, `split2` through BS=512, then unsplit TC. Rubin uses `split4`
-through BS=128, `split2` through BS=1024, then unsplit TC. Split-KV is enabled
-only for the supported causal BF16 D=128 layout when average KV length is at
-least 1536; shorter or unsupported cases preserve the existing path.
+These early per-shape boundaries were useful for proving the split-KV idea,
+but are superseded by the fixed broad-sweep policy above. Production now uses
+unsplit TC on B300 and split2 TC on Rubin for every supported target shape.
 
 ## Forward tile-shape experiment
 
@@ -134,7 +172,7 @@ this SM100-family UMMA path. K is loaded once and reinterpreted as the
 transposed dQ operand in shared memory. Four compute warps replace eight for
 the reduced Q tile.
 
-## Pre-split backward automatic dispatch
+## Historical pre-split backward automatic dispatch
 
 Before adding backward split-KV, the crossover was measured at extra batch
 sizes rather than inferred from the three target points:
@@ -280,7 +318,7 @@ best for large B300 grids. A 1024-thread CTA reduces CTA residency and remains
 much slower at large batch sizes. Vector loads with scalar stores were also
 rejected: the scalar stores raise final B300 BS=1024 from 1.74 to 2.09 ms.
 
-### Split-KV direct backward
+### Historical per-shape split-KV direct backward
 
 The direct qlen=1 backward is also additive over KV partitions for dQ. Each
 split CTA owns a contiguous KV range, writes its disjoint dK/dV rows normally,
@@ -297,8 +335,9 @@ about 32 average KV rows per CTA. B300 accepts split8 as its last useful
 crossover; Rubin requires at least split16 because its unsplit direct kernel
 is already faster at large grids.
 
-The final automatic choices and same-allocation comparisons use 10 warmups
-and the median of five groups of 30 executions:
+The following early automatic choices and same-allocation comparisons used 10
+warmups and the median of five groups of 30 executions. They are superseded by
+the fixed split22/split26 policy from the 36-case sweep:
 
 | GPU | Batch | Previous dispatch (ms) | Split selection | Final (ms) | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -341,17 +380,15 @@ experiment is retained.
 ## Design
 
 The forward kernel uses one Q stage for a one-token query, removing the
-second fully masked 128-row Q tile. The new split-KV schedule increases CTA
-parallelism only at measured crossover points and fuses the partial-output
-reduction into its epilogue.
+second fully masked 128-row Q tile. B300 always uses the unsplit M128/N128
+tensor-core schedule for the supported target, while Rubin always uses two KV
+partitions and atomically combines their partial outputs in the epilogue.
 
-Backward chooses among the original tensor-core kernel, the new small-MMA
-Q-major kernel, and the vectorized CUDA-core `hstu_bwd_q1.py` using the
-measured architecture-specific crossovers above. For long BF16 KV sequences,
-the direct kernel additionally splits the KV range across independently
-scheduled CTAs and atomically combines only dQ. Unsupported layouts,
-non-causal or arbitrary masks, FP16, and short-KV cases keep the existing
-implementation.
+Backward always uses the vectorized Q-major CUDA-core `hstu_bwd_q1.py` for the
+supported target. B300 splits the KV range 22 ways and Rubin splits it 26
+ways. Each CTA writes disjoint dK/dV rows directly; only dQ is atomically
+combined. Unsupported layouts, non-causal or arbitrary masks, FP16, and other
+head dimensions keep the existing implementation.
 
 This is the same high-level loop-order lesson as the FA2 `bwd_loop_opt`
 branch, specialized further for the exact one-query case.
@@ -365,6 +402,8 @@ forced-path test checks `tc-small` against `tc` at KV lengths
 `1, 127, 128, 129, 2049`; dQ, dK, and dV are bitwise identical on both B300
 and Rubin. Forced `split2` and `split4` forward runs pass the boundary-heavy
 forward oracle on both architectures; the largest observed forward absolute
-error is below `1.6e-5`. Forced backward split8, split16, and split64 runs
-also pass on both architectures; dQ reaches `6.2e-5` maximum absolute error
-from BF16 atomic accumulation, while dK/dV remain below `1e-6`.
+error is below `1.6e-5`. Forced backward split8, split16, split22, split26,
+and split64 runs pass on the tested architectures. The final automatic
+split22/split26 boundary oracle has maximum absolute errors below `3.8e-5`
+for dQ and `1e-6` for dK/dV. BF16 dQ atomic ordering accounts for the larger
+dQ error.

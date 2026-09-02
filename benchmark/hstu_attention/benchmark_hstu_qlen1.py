@@ -401,6 +401,8 @@ def main() -> None:
             "direct-split4",
             "direct-split8",
             "direct-split16",
+            "direct-split22",
+            "direct-split26",
             "direct-split32",
             "direct-split64",
             "tc",
@@ -482,9 +484,6 @@ def main() -> None:
                 split_kv = _interface._select_q1_bwd_split_kv(
                     "auto",
                     torch.cuda.get_device_capability(device),
-                    batch_size,
-                    args.heads,
-                    sum(k_lengths) // batch_size,
                     dtype == torch.bfloat16 and args.head_dim == 128 and args.mask == "causal",
                 )
                 if split_kv > 1:

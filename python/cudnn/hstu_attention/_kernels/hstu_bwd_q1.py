@@ -44,7 +44,7 @@ class HSTUAttentionBackwardQlen1Sm100:
 
     def __init__(self, element_dtype: Type[cutlass.Numeric], num_threads: int = 256, split_kv: int = 1):
         assert 0 < num_threads <= 1024 and num_threads % cute.arch.WARP_SIZE == 0
-        assert split_kv in (1, 2, 4, 8, 16, 32, 64)
+        assert split_kv in (1, 2, 4, 8, 16, 22, 26, 32, 64)
         self.element_dtype = element_dtype
         self.num_threads = num_threads
         self.num_warps = num_threads // cute.arch.WARP_SIZE
